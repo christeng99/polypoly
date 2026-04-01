@@ -9,8 +9,9 @@ use serde_json::json;
 use std::str::FromStr;
 
 const USDC_DECIMALS: u32 = 6;
-const USDC_MIN_STEP: u128 = 10_000; // 0.01 USDC in 1e6 units
-const OUTCOME_MIN_STEP: u128 = 10; // 0.00001 shares in 1e6 units
+const USDC_MIN_STEP: u128 = 10_000; // 0.01 USDC in 1e6 units (2 decimals)
+/// Outcome token amounts: CLOB allows max **4** decimal places on the outcome leg (buy taker / sell maker).
+const OUTCOME_SHARE_4DP_STEP: u128 = 100; // 0.0001 shares in 1e6 units
 const EXCHANGE_137: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 const EXCHANGE_80002: &str = "0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40";
 
@@ -121,10 +122,10 @@ impl OrderSigner {
         let maker_amount = if is_buy {
             Self::floor_to_step(maker_raw, USDC_MIN_STEP)
         } else {
-            Self::floor_to_step(maker_raw, OUTCOME_MIN_STEP)
+            Self::floor_to_step(maker_raw, OUTCOME_SHARE_4DP_STEP)
         };
         let taker_amount = if is_buy {
-            Self::floor_to_step(taker_raw, OUTCOME_MIN_STEP)
+            Self::floor_to_step(taker_raw, OUTCOME_SHARE_4DP_STEP)
         } else {
             Self::floor_to_step(taker_raw, USDC_MIN_STEP)
         };

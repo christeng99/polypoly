@@ -260,7 +260,7 @@ impl ClobClient {
     }
 
     /// Refresh balance cache, then return sellable conditional token size in **shares**.
-    /// Raw balance is floored to `OUTCOME_MIN_STEP` (10 raw = 1e-5 shares) so the signed order matches CLOB precision.
+    /// Raw balance is floored to 4-decimal outcome steps (100 raw = 0.0001 shares) to match `clob_signer`.
     pub async fn conditional_token_sellable_shares(
         &self,
         signer: &OrderSigner,
@@ -274,7 +274,7 @@ impl ClobClient {
             .l2_get_balance_allowance(signer, token_id, signature_type)
             .await?;
         let raw: u128 = b.balance.parse().context("balance parse")?;
-        const OUTCOME_STEP_RAW: u128 = 10; // matches `clob_signer::OUTCOME_MIN_STEP`
+        const OUTCOME_STEP_RAW: u128 = 100; // matches `clob_signer::OUTCOME_SHARE_4DP_STEP`
         if raw < OUTCOME_STEP_RAW {
             return Ok(0.0);
         }

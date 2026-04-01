@@ -70,8 +70,8 @@ impl BotHandle {
         self.nonce_seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Outcome-token step (5 decimals) aligned with `clob_signer` taker leg flooring.
-    const OUTCOME_SHARE_STEP: f64 = 1e-5;
+    /// Outcome-token step (4 decimals) aligned with CLOB + `clob_signer`.
+    const OUTCOME_SHARE_STEP: f64 = 1e-4;
 
     fn floor_shares_step(shares: f64) -> f64 {
         if !shares.is_finite() || shares <= 0.0 {
