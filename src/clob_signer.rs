@@ -7,9 +7,10 @@ use ethers_core::utils::to_checksum;
 use ethers_signers::{LocalWallet, Signer};
 use serde_json::json;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const USDC_DECIMALS: u32 = 6;
+const USDC_MIN_STEP: u128 = 10_000; // 0.01 USDC in 1e6 units
+const OUTCOME_MIN_STEP: u128 = 10; // 0.00001 shares in 1e6 units
 const EXCHANGE_137: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 const EXCHANGE_80002: &str = "0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40";
 
@@ -19,6 +20,10 @@ pub struct OrderSigner {
 }
 
 impl OrderSigner {
+    fn floor_to_step(value: u128, step: u128) -> u128 {
+        (value / step) * step
+    }
+
     fn exchange_address(&self) -> &'static str {
         match self.chain_id {
             80002 => EXCHANGE_80002,
@@ -87,6 +92,8 @@ impl OrderSigner {
     }
 
     /// Sign limit order for CLOB. `maker` is the funder / Safe address (checksummed string).
+    /// `salt` provides per-order uniqueness (official SDK uses `int(time.time())`).
+    /// Order `nonce` is always 0 (cancellation group id, not a counter).
     pub async fn sign_limit_order(
         &self,
         token_id: &str,
@@ -94,25 +101,41 @@ impl OrderSigner {
         size: f64,
         side: &str,
         maker: &str,
-        nonce: u64,
+        salt: u64,
         fee_rate_bps: u32,
         signature_type: u8,
     ) -> Result<crate::clob_types::OrderPayload> {
-        let side_u = if side.eq_ignore_ascii_case("BUY") { 0u8 } else { 1u8 };
-        let maker_amount =
-            (size * price * 10_f64.powi(USDC_DECIMALS as i32)).round() as u128;
-        let taker_amount = (size * 10_f64.powi(USDC_DECIMALS as i32)).round() as u128;
+        let is_buy = side.eq_ignore_ascii_case("BUY");
+        let side_u = if is_buy { 0u8 } else { 1u8 };
+        let unit = 10_f64.powi(USDC_DECIMALS as i32);
+        let maker_raw = if is_buy {
+            (size * price * unit) as u128
+        } else {
+            (size * unit) as u128
+        };
+        let taker_raw = if is_buy {
+            (size * unit) as u128
+        } else {
+            (size * price * unit) as u128
+        };
+        let maker_amount = if is_buy {
+            Self::floor_to_step(maker_raw, USDC_MIN_STEP)
+        } else {
+            Self::floor_to_step(maker_raw, OUTCOME_MIN_STEP)
+        };
+        let taker_amount = if is_buy {
+            Self::floor_to_step(taker_raw, OUTCOME_MIN_STEP)
+        } else {
+            Self::floor_to_step(taker_raw, USDC_MIN_STEP)
+        };
+        anyhow::ensure!(maker_amount > 0, "maker amount rounds to zero");
+        anyhow::ensure!(taker_amount > 0, "taker amount rounds to zero");
 
         let maker_addr = maker
             .parse::<Address>()
             .with_context(|| "invalid maker / funder address")?;
         let maker_cs = to_checksum(&maker_addr, None);
         let signer_addr = self.address_checksum();
-        let salt = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-            ^ nonce;
 
         let token_u = U256::from_dec_str(token_id.trim())
             .with_context(|| "token_id must be a decimal numeric string for EIP-712")?;
@@ -155,7 +178,7 @@ impl OrderSigner {
                 "makerAmount": maker_amount.to_string(),
                 "takerAmount": taker_amount.to_string(),
                 "expiration": "0",
-                "nonce": nonce,
+                "nonce": 0,
                 "feeRateBps": fee_rate_bps,
                 "side": side_u,
                 "signatureType": signature_type
@@ -179,7 +202,7 @@ impl OrderSigner {
             taker_amount: taker_amount.to_string(),
             side: side.to_uppercase(),
             expiration: "0".to_string(),
-            nonce: nonce.to_string(),
+            nonce: "0".to_string(),
             fee_rate_bps: fee_rate_bps.to_string(),
             signature,
             salt,

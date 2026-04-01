@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -26,6 +27,7 @@ pub struct BotHandle {
     last_fire: Mutex<Option<Instant>>,
     positions: Mutex<HashMap<String, f64>>,
     trade_lock: Mutex<()>,
+    nonce_seq: AtomicU64,
     actions: Option<Arc<ActionStore>>,
     state: Mutex<BotStateView>,
 }
@@ -41,6 +43,10 @@ impl BotHandle {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    fn next_salt(&self) -> u64 {
+        self.nonce_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     pub async fn from_config(cfg: BotConfig, actions: Option<Arc<ActionStore>>) -> Result<Arc<Self>> {
@@ -61,6 +67,7 @@ impl BotHandle {
             last_fire: Mutex::new(None),
             positions: Mutex::new(HashMap::new()),
             trade_lock: Mutex::new(()),
+            nonce_seq: AtomicU64::new(Self::now_unix_secs()),
             actions,
             state: Mutex::new(BotStateView::default()),
         }))
@@ -109,16 +116,25 @@ impl BotHandle {
                     }
                 }
             }
+
+            let mut buy_size = self.cfg.size;
+            let min_notional = 1.0f64;
+            let notional = quote.best_ask * buy_size;
+            if notional < min_notional {
+                let required = (min_notional / quote.best_ask).ceil();
+                if required > buy_size {
+                    buy_size = required;
+                }
+            }
         
             let mut last_err: Option<String> = None;
             for attempt in 1..=3 {
                 println!(
                     "[bot:{}] BUY attempt {attempt}/3 coin={} slug={} token={} px={} size={}",
-                    self.cfg.id, quote.coin, quote.market_slug, quote.token_id, quote.best_ask, self.cfg.size
+                    self.cfg.id, quote.coin, quote.market_slug, quote.token_id, quote.best_ask, buy_size
                 );
                 match self
-                    .place_order(&quote.token_id, quote.best_ask, self.cfg.size, "BUY")
-                    // .place_order(&quote.token_id, quote.best_ask, self.cfg.size, "BUY")
+                    .place_order(&quote.token_id, quote.best_ask, buy_size, "BUY")
                     .await
                 {
                     Ok(order_id) => {
@@ -128,14 +144,14 @@ impl BotHandle {
                         );
                         {
                             let mut p = self.positions.lock().await;
-                            p.insert(quote.token_id.clone(), self.cfg.size);
+                            p.insert(quote.token_id.clone(), buy_size);
                         }
                         if let Some(db) = &self.actions {
                             let _ = db.log_action(
                                 &quote.coin,
                                 &quote.market_slug,
-                                self.cfg.size,
-                                self.cfg.size * quote.best_ask,
+                                buy_size,
+                                buy_size * quote.best_ask,
                                 "buy",
                             );
                         }
@@ -214,10 +230,7 @@ impl BotHandle {
         size: f64,
         side: &str,
     ) -> Result<Option<String>> {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let salt = self.next_salt();
         let payload = self
             .signer
             .sign_limit_order(
@@ -226,7 +239,7 @@ impl BotHandle {
                 size,
                 side,
                 &self.cfg.funder,
-                nonce,
+                salt,
                 self.cfg.fee_rate_bps,
                 self.cfg.signature_type,
             )
