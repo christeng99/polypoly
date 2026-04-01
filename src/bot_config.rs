@@ -20,7 +20,8 @@ pub struct BotConfig {
     pub buy_below: Option<f64>,
     /// Fire SELL when `mid >= sell_above` (and book has a valid bid).
     pub sell_above: Option<f64>,
-    pub size: f64,
+    /// Target USDC notional per BUY (`POLY_BOT_<ID>_ONTIME_AMOUNT`). Min $1 enforced at runtime.
+    pub ontime_amount_usd: f64,
     pub private_key: String,
     pub funder: String,
     pub clob_host: String,
@@ -108,7 +109,7 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
         let sell_above =
             env_trim_opt(&bot_env_key(id, "SELL_ABOVE")).and_then(|s| s.parse().ok());
 
-        let size = env_trim_opt(&bot_env_key(id, "SIZE"))
+        let ontime_amount_usd = env_trim_opt(&bot_env_key(id, "ONTIME_AMOUNT"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(5.0);
 
@@ -135,7 +136,7 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             legs,
             buy_below,
             sell_above,
-            size,
+            ontime_amount_usd,
             private_key,
             funder,
             clob_host: global_host.clone(),

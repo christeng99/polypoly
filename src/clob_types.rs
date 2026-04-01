@@ -56,3 +56,9 @@ pub struct PostOrderResponse {
     #[serde(rename = "errorMsg")]
     pub error_msg: Option<String>,
 }
+
+/// `GET /balance-allowance` (balance in 6-decimal fixed units for conditional tokens).
+#[derive(Debug, Deserialize)]
+pub struct BalanceAllowanceResponse {
+    pub balance: String,
+}

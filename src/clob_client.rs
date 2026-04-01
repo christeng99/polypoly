@@ -5,16 +5,23 @@ use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAF
 use ethers_core::types::Address;
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use sha2::Sha256;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::clob_signer::OrderSigner;
-use crate::clob_types::{ApiCredentials, OrderPayload, PostOrderBody, PostOrderResponse};
+use crate::clob_types::{
+    ApiCredentials, BalanceAllowanceResponse, OrderPayload, PostOrderBody, PostOrderResponse,
+};
+use serde_json::Value;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// L2 HMAC message uses this path only (no query string), matching py-clob `RequestArgs.request_path`.
+const PATH_BALANCE_ALLOWANCE: &str = "/balance-allowance";
+const PATH_UPDATE_BALANCE_ALLOWANCE: &str = "/balance-allowance/update";
 
 pub struct ClobClient {
     http: Client,
@@ -168,7 +175,7 @@ impl ClobClient {
             defer_exec: false,
         };
         let body = serde_json::to_string(&body_struct).context("serialize order")?;
-        println!("[clob] POST /order body={body}");
+
         let path = "/order";
         let headers = Self::build_l2(&creds, &signer.address_checksum(), "POST", path, &body)?;
 
@@ -183,17 +190,186 @@ impl ClobClient {
             .context("POST /order")?;
 
         let status = resp.status();
+        let code = status.as_u16();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            println!(
+                "[clob] POST /order -> {} {}",
+                code,
+                clip_one_line(&text, 180)
+            );
             anyhow::bail!("order HTTP {}: {}", status, text);
         }
         let v: PostOrderResponse = serde_json::from_str(&text).unwrap_or(PostOrderResponse {
             success: Some(false),
             order_id: None,
-            error_msg: Some(text),
+            error_msg: Some(text.clone()),
         });
+        let line = if v.success.unwrap_or(false) {
+            format!(
+                "[clob] POST /order -> {} ok oid={}",
+                code,
+                v.order_id
+                    .as_deref()
+                    .map(|o| clip_one_line(o, 32))
+                    .unwrap_or_else(|| "-".into())
+            )
+        } else {
+            format!(
+                "[clob] POST /order -> {} reject {}",
+                code,
+                clip_one_line(
+                    v.error_msg.as_deref().unwrap_or(&text),
+                    140,
+                )
+            )
+        };
+        println!("{line}");
         Ok(v)
     }
+
+    /// Best bid for `side=BUY`, best ask for `side=SELL` (per CLOB `/price` docs).
+    pub async fn get_market_price(&self, token_id: &str, side: &str) -> Result<f64> {
+        let mut u = Url::parse(&format!("{}/price", self.host)).context("price url")?;
+        u.query_pairs_mut()
+            .append_pair("token_id", token_id)
+            .append_pair("side", side);
+        let resp = self.http.get(u).send().await.context("GET /price")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("price HTTP {}: {}", status, text);
+        }
+        let v: Value = serde_json::from_str(&text).context("price json")?;
+        json_f64(&v, "price").with_context(|| format!("price field missing: {text}"))
+    }
+
+    pub async fn get_midpoint(&self, token_id: &str) -> Result<f64> {
+        let mut u = Url::parse(&format!("{}/midpoint", self.host)).context("midpoint url")?;
+        u.query_pairs_mut().append_pair("token_id", token_id);
+        let resp = self.http.get(u).send().await.context("GET /midpoint")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("midpoint HTTP {}: {}", status, text);
+        }
+        let v: Value = serde_json::from_str(&text).context("midpoint json")?;
+        json_f64(&v, "mid_price")
+            .or_else(|| json_f64(&v, "mid"))
+            .with_context(|| format!("mid_price field missing: {text}"))
+    }
+
+    /// Refresh balance cache, then return sellable conditional token size in **shares**.
+    /// Raw balance is floored to `OUTCOME_MIN_STEP` (10 raw = 1e-5 shares) so the signed order matches CLOB precision.
+    pub async fn conditional_token_sellable_shares(
+        &self,
+        signer: &OrderSigner,
+        token_id: &str,
+        signature_type: u8,
+    ) -> Result<f64> {
+        let _ = self
+            .l2_get_balance_allowance_refresh(signer, token_id, signature_type)
+            .await;
+        let b = self
+            .l2_get_balance_allowance(signer, token_id, signature_type)
+            .await?;
+        let raw: u128 = b.balance.parse().context("balance parse")?;
+        const OUTCOME_STEP_RAW: u128 = 10; // matches `clob_signer::OUTCOME_MIN_STEP`
+        if raw < OUTCOME_STEP_RAW {
+            return Ok(0.0);
+        }
+        let adj = (raw / OUTCOME_STEP_RAW) * OUTCOME_STEP_RAW;
+        Ok(adj as f64 / 1_000_000.0)
+    }
+
+    async fn l2_get_balance_allowance_refresh(
+        &self,
+        signer: &OrderSigner,
+        token_id: &str,
+        signature_type: u8,
+    ) -> Result<()> {
+        let creds = self.ensure_creds(signer).await?;
+        let st = signature_type.to_string();
+        let mut u = Url::parse(&format!("{}{}", self.host, PATH_UPDATE_BALANCE_ALLOWANCE))
+            .context("balance update url")?;
+        u.query_pairs_mut()
+            .append_pair("asset_type", "CONDITIONAL")
+            .append_pair("token_id", token_id)
+            .append_pair("signature_type", st.as_str());
+        let headers = Self::build_l2(
+            &creds,
+            &signer.address_checksum(),
+            "GET",
+            PATH_UPDATE_BALANCE_ALLOWANCE,
+            "",
+        )?;
+        let resp = self
+            .http
+            .get(u)
+            .headers(headers)
+            .send()
+            .await
+            .context("GET balance-allowance/update")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let t = resp.text().await.unwrap_or_default();
+            anyhow::bail!("balance-allowance/update HTTP {}: {}", status, t);
+        }
+        Ok(())
+    }
+
+    async fn l2_get_balance_allowance(
+        &self,
+        signer: &OrderSigner,
+        token_id: &str,
+        signature_type: u8,
+    ) -> Result<BalanceAllowanceResponse> {
+        let creds = self.ensure_creds(signer).await?;
+        let st = signature_type.to_string();
+        let mut u =
+            Url::parse(&format!("{}{}", self.host, PATH_BALANCE_ALLOWANCE)).context("balance url")?;
+        u.query_pairs_mut()
+            .append_pair("asset_type", "CONDITIONAL")
+            .append_pair("token_id", token_id)
+            .append_pair("signature_type", st.as_str());
+        let headers = Self::build_l2(
+            &creds,
+            &signer.address_checksum(),
+            "GET",
+            PATH_BALANCE_ALLOWANCE,
+            "",
+        )?;
+        let resp = self
+            .http
+            .get(u)
+            .headers(headers)
+            .send()
+            .await
+            .context("GET balance-allowance")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("balance-allowance HTTP {}: {}", status, text);
+        }
+        serde_json::from_str(&text).context("balance-allowance json")
+    }
+}
+
+fn clip_one_line(s: &str, max_chars: usize) -> String {
+    let t: String = s.chars().filter(|c| !c.is_control()).collect();
+    if t.chars().count() <= max_chars {
+        t
+    } else {
+        t.chars().take(max_chars).collect::<String>() + "…"
+    }
+}
+
+fn json_f64(v: &Value, key: &str) -> Option<f64> {
+    let x = v.get(key)?;
+    if let Some(f) = x.as_f64() {
+        return Some(f);
+    }
+    x.as_str()?.parse().ok()
 }
 
 fn unix_secs_string() -> String {

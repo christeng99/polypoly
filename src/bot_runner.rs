@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::action_store::ActionStore;
@@ -32,6 +32,27 @@ pub struct BotHandle {
     state: Mutex<BotStateView>,
 }
 
+fn short_tok(token_id: &str) -> String {
+    if token_id.len() <= 12 {
+        token_id.to_string()
+    } else {
+        format!("…{}", &token_id[token_id.len() - 10..])
+    }
+}
+
+/// Consecutive BUY attempts with fresh ask between tries.
+const BUY_RETRY_ATTEMPTS: u32 = 7;
+
+fn clip_log(s: &str, max: usize) -> String {
+    let mut it = s.chars();
+    let chunk: String = it.by_ref().take(max).collect();
+    if it.next().is_some() {
+        chunk + "…"
+    } else {
+        chunk
+    }
+}
+
 impl BotHandle {
     fn round_start_secs_from_slug(slug: &str) -> Option<u64> {
         let (_, tail) = slug.rsplit_once('-')?;
@@ -47,6 +68,27 @@ impl BotHandle {
 
     fn next_salt(&self) -> u64 {
         self.nonce_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Outcome-token step (5 decimals) aligned with `clob_signer` taker leg flooring.
+    const OUTCOME_SHARE_STEP: f64 = 1e-5;
+
+    fn floor_shares_step(shares: f64) -> f64 {
+        if !shares.is_finite() || shares <= 0.0 {
+            return 0.0;
+        }
+        (shares / Self::OUTCOME_SHARE_STEP).floor() * Self::OUTCOME_SHARE_STEP
+    }
+
+    /// Target ~`usd` notional at `ask`; enforces Polymarket ~$1 minimum and 5-decimal share steps.
+    fn buy_shares_for_usd(ask: f64, usd: f64) -> anyhow::Result<f64> {
+        anyhow::ensure!(ask > 0.0 && ask < 1.0, "invalid ask {ask}");
+        let target = usd.max(1.0);
+        let min_for_dollar = ((1.0 / ask) / Self::OUTCOME_SHARE_STEP).ceil() * Self::OUTCOME_SHARE_STEP;
+        let want = ((target / ask) / Self::OUTCOME_SHARE_STEP).floor() * Self::OUTCOME_SHARE_STEP;
+        let s = want.max(min_for_dollar);
+        anyhow::ensure!(s > 0.0 && s.is_finite(), "buy size rounds to zero");
+        Ok(s)
     }
 
     pub async fn from_config(cfg: BotConfig, actions: Option<Arc<ActionStore>>) -> Result<Arc<Self>> {
@@ -117,61 +159,118 @@ impl BotHandle {
                 }
             }
 
-            let mut buy_size = self.cfg.size;
-            let min_notional = 1.0f64;
-            let notional = quote.best_ask * buy_size;
-            if notional < min_notional {
-                let required = (min_notional / quote.best_ask).ceil();
-                if required > buy_size {
-                    buy_size = required;
-                }
-            }
-        
             let mut last_err: Option<String> = None;
-            for attempt in 1..=3 {
+            for attempt in 1..=BUY_RETRY_ATTEMPTS {
+                if attempt > 1 {
+                    tokio::time::sleep(Duration::from_millis(120 * attempt as u64)).await;
+                }
+
+                let mid = self
+                    .clob
+                    .get_midpoint(&quote.token_id)
+                    .await
+                    .unwrap_or(quote.mid);
+                let best_ask = match self.clob.get_market_price(&quote.token_id, "SELL").await {
+                    Ok(px) => px,
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        println!(
+                            "[bot:{}] BUY {}/{} skip ask {} tok={} {}",
+                            self.cfg.id,
+                            attempt,
+                            BUY_RETRY_ATTEMPTS,
+                            quote.coin,
+                            short_tok(&quote.token_id),
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                if !(mid <= th && best_ask > 0.0 && best_ask < 1.0) {
+                    last_err = Some(format!(
+                        "buy gate failed mid={mid:.4} ask={best_ask:.4} (threshold {th})"
+                    ));
+                    continue;
+                }
+
+                let buy_size = match Self::buy_shares_for_usd(best_ask, self.cfg.ontime_amount_usd) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        continue;
+                    }
+                };
+
                 println!(
-                    "[bot:{}] BUY attempt {attempt}/3 coin={} slug={} token={} px={} size={}",
-                    self.cfg.id, quote.coin, quote.market_slug, quote.token_id, quote.best_ask, buy_size
+                    "[bot:{}] BUY {}/{} {} …{} mid={:.3} px={:.3} sz={:.4} ~${:.2}",
+                    self.cfg.id,
+                    attempt,
+                    BUY_RETRY_ATTEMPTS,
+                    quote.coin,
+                    short_tok(&quote.token_id),
+                    mid,
+                    best_ask,
+                    buy_size,
+                    buy_size * best_ask
                 );
                 match self
-                    .place_order(&quote.token_id, quote.best_ask, buy_size, "BUY")
+                    .place_order(&quote.token_id, best_ask, buy_size, "BUY")
                     .await
                 {
                     Ok(order_id) => {
+                        let tracked = self
+                            .clob
+                            .conditional_token_sellable_shares(
+                                &self.signer,
+                                &quote.token_id,
+                                self.cfg.signature_type,
+                            )
+                            .await
+                            .unwrap_or(buy_size);
                         println!(
-                            "[bot:{}] BUY success coin={} slug={} token={} order_id={:?}",
-                            self.cfg.id, quote.coin, quote.market_slug, quote.token_id, order_id
+                            "[bot:{}] BUY ok {} tok={} pos={:.4} oid={:?}",
+                            self.cfg.id,
+                            quote.coin,
+                            short_tok(&quote.token_id),
+                            tracked,
+                            order_id
                         );
                         {
                             let mut p = self.positions.lock().await;
-                            p.insert(quote.token_id.clone(), buy_size);
+                            p.insert(quote.token_id.clone(), tracked);
                         }
                         if let Some(db) = &self.actions {
                             let _ = db.log_action(
                                 &quote.coin,
                                 &quote.market_slug,
-                                buy_size,
-                                buy_size * quote.best_ask,
+                                tracked,
+                                tracked * best_ask,
                                 "buy",
                             );
                         }
                         let mut st = self.state.lock().await;
-                        st.last_decision = format!("BUY ok slug={} mid={:.4}", quote.market_slug, quote.mid);
+                        st.last_decision = format!("BUY ok slug={} mid={:.4}", quote.market_slug, mid);
                         st.last_order_id = order_id;
                         st.last_error = None;
                         return;
                     }
                     Err(e) => {
                         println!(
-                            "[bot:{}] BUY failed attempt {attempt}/3 coin={} slug={} token={} err={}",
-                            self.cfg.id, quote.coin, quote.market_slug, quote.token_id, e
+                            "[bot:{}] BUY {}/{} fail {} tok={} | {}",
+                            self.cfg.id,
+                            attempt,
+                            BUY_RETRY_ATTEMPTS,
+                            quote.coin,
+                            short_tok(&quote.token_id),
+                            clip_log(&e.to_string(), 90)
                         );
                         last_err = Some(e.to_string());
                     }
                 }
             }
             let mut st = self.state.lock().await;
-            st.last_decision = "BUY failed after 3 retries".to_string();
+            st.last_decision = format!("BUY failed after {BUY_RETRY_ATTEMPTS} retries");
             st.last_error = last_err;
             return;
         }
@@ -183,15 +282,75 @@ impl BotHandle {
             return;
         }
 
+        let mid = self
+            .clob
+            .get_midpoint(&quote.token_id)
+            .await
+            .unwrap_or(quote.mid);
+        let best_bid = match self.clob.get_market_price(&quote.token_id, "BUY").await {
+            Ok(px) => px,
+            Err(e) => {
+                println!(
+                    "[bot:{}] SELL skip bid {} tok={} {}",
+                    self.cfg.id, quote.coin, short_tok(&quote.token_id), e
+                );
+                let mut st = self.state.lock().await;
+                st.last_error = Some(e.to_string());
+                return;
+            }
+        };
+
+        if !(mid >= th && best_bid > 0.0 && best_bid < 1.0) {
+            return;
+        }
+
+        let sellable = match self
+            .clob
+            .conditional_token_sellable_shares(
+                &self.signer,
+                &quote.token_id,
+                self.cfg.signature_type,
+            )
+            .await
+        {
+            Ok(s) => Self::floor_shares_step(s),
+            Err(e) => {
+                println!(
+                    "[bot:{}] SELL bal? {} tok={} fallback×0.999 ({})",
+                    self.cfg.id, quote.coin, short_tok(&quote.token_id), e
+                );
+                Self::floor_shares_step(held * 0.999)
+            }
+        };
+
+        if sellable <= 0.0 {
+            println!(
+                "[bot:{}] SELL skip 0 {} tok={} trk={:.4}",
+                self.cfg.id, quote.coin, short_tok(&quote.token_id), held
+            );
+            let mut p = self.positions.lock().await;
+            p.remove(&quote.token_id);
+            return;
+        }
+
         println!(
-            "[bot:{}] SELL attempt coin={} slug={} token={} px={} size={}",
-            self.cfg.id, quote.coin, quote.market_slug, quote.token_id, quote.best_bid, held
+            "[bot:{}] SELL {} …{} mid={:.3} px={:.3} sz={:.4} trk={:.4}",
+            self.cfg.id,
+            quote.coin,
+            short_tok(&quote.token_id),
+            mid,
+            best_bid,
+            sellable,
+            held
         );
-        match self.place_order(&quote.token_id, quote.best_bid, held, "SELL").await {
+        match self
+            .place_order(&quote.token_id, best_bid, sellable, "SELL")
+            .await
+        {
             Ok(order_id) => {
                 println!(
-                    "[bot:{}] SELL success coin={} slug={} token={} order_id={:?}",
-                    self.cfg.id, quote.coin, quote.market_slug, quote.token_id, order_id
+                    "[bot:{}] SELL ok {} tok={} oid={:?}",
+                    self.cfg.id, quote.coin, short_tok(&quote.token_id), order_id
                 );
                 {
                     let mut p = self.positions.lock().await;
@@ -201,20 +360,23 @@ impl BotHandle {
                     let _ = db.log_action(
                         &quote.coin,
                         &quote.market_slug,
-                        held,
-                        held * quote.best_bid,
+                        sellable,
+                        sellable * best_bid,
                         "sell",
                     );
                 }
                 let mut st = self.state.lock().await;
-                st.last_decision = format!("SELL ok slug={} mid={:.4}", quote.market_slug, quote.mid);
+                st.last_decision = format!("SELL ok slug={} mid={:.4}", quote.market_slug, mid);
                 st.last_order_id = order_id;
                 st.last_error = None;
             }
             Err(e) => {
                 println!(
-                    "[bot:{}] SELL failed coin={} slug={} token={} err={}",
-                    self.cfg.id, quote.coin, quote.market_slug, quote.token_id, e
+                    "[bot:{}] SELL fail {} tok={} | {}",
+                    self.cfg.id,
+                    quote.coin,
+                    short_tok(&quote.token_id),
+                    clip_log(&e.to_string(), 90)
                 );
                 let mut st = self.state.lock().await;
                 st.last_decision = "SELL retry pending".to_string();
