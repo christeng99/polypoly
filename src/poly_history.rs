@@ -1,7 +1,9 @@
 //! Buffered price history JSON: `{coin}_{up|down}.json` under `POLY_HISTORY_DIR` (default `./data/poly_history/`).
 //!
-//! Each file is `{ "slug": [mid_price, ...], ... }`. Mids are **rounded to 0.01** (cent); a value is
-//! appended only when that rounded level **changes** from the last stored point. Flushes every [`FLUSH_INTERVAL_SECS`] and on round end.
+//! Each file is `{ "slug": [tick, ...], ... }` where each **tick** is an integer **hundredth** (probability
+//! × 100, e.g. `95` → 0.95). This avoids `f64` serialization noise and keeps JSON compact. Legacy float
+//! arrays are still loaded and converted. A tick is appended only when it **changes** from the last
+//! stored point. Flushes every [`FLUSH_INTERVAL_SECS`] and on round end.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,8 +20,8 @@ pub const FLUSH_INTERVAL_SECS: u64 = 10;
 /// Mid prices are quantized to this step (e.g. 0.01 → hundredths) for compare + store.
 const MID_TICK: f64 = 0.01;
 
-/// `{ "slug": [mid, mid, ...], ... }`
-pub type SlugFile = BTreeMap<String, Vec<f64>>;
+/// `{ "slug": [hundredth, ...], ... }` — integer ticks (probability × 100).
+pub type SlugFile = BTreeMap<String, Vec<i32>>;
 
 struct Inner {
     root: PathBuf,
@@ -47,7 +49,7 @@ impl PolyHistory {
         }
     }
 
-    /// Appends `round(mid_raw, 0.01)` only if that cent level differs from the last stored point.
+    /// Appends `hundredth = round(mid / 0.01)` only if it differs from the last stored tick.
     pub fn record_price_change(
         &self,
         coin: &str,
@@ -65,7 +67,7 @@ impl PolyHistory {
             return;
         }
 
-        let mid = mid_to_tick(mid_from_bid_ask(best_bid, best_ask));
+        let tick = tick_from_mid(mid_from_bid_ask(best_bid, best_ask));
 
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let path = g.root.join(format!("{coin_key}_{side}.json"));
@@ -80,8 +82,8 @@ impl PolyHistory {
 
         let doc = g.files.get_mut(&path).expect("just inserted");
         let series = doc.entry(slug.to_string()).or_default();
-        if mid_changed(series.as_slice(), mid) {
-            series.push(mid);
+        if mid_changed(series.as_slice(), tick) {
+            series.push(tick);
             g.dirty.insert(path);
         }
     }
@@ -123,19 +125,26 @@ impl PolyHistory {
     }
 }
 
-fn mid_changed(series: &[f64], mid: f64) -> bool {
+fn mid_changed(series: &[i32], tick: i32) -> bool {
     match series.last() {
         None => true,
-        Some(prev) => (mid - *prev).abs() >= MID_TICK * 0.5,
+        Some(prev) => *prev != tick,
     }
 }
 
-/// Round to nearest `MID_TICK` (e.g. 0.01).
-fn mid_to_tick(mid: f64) -> f64 {
+/// Nearest hundredth as an integer tick (probability × 100).
+fn tick_from_mid(mid: f64) -> i32 {
     if !mid.is_finite() {
-        return 0.0;
+        return 0;
     }
-    (mid / MID_TICK).round() * MID_TICK
+    let t = (mid / MID_TICK).round();
+    if t > f64::from(i32::MAX) {
+        i32::MAX
+    } else if t < f64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        t as i32
+    }
 }
 
 fn mid_from_bid_ask(best_bid: f64, best_ask: f64) -> f64 {
@@ -165,16 +174,25 @@ fn parse_file_content(s: &str) -> SlugFile {
         };
         let mut mids = Vec::new();
         for item in arr {
-            if let Some(n) = item.as_f64() {
-                mids.push(mid_to_tick(n));
+            if let Some(n) = item.as_i64() {
+                if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
+                    mids.push(n as i32);
+                }
+            } else if let Some(n) = item.as_u64() {
+                if n <= i32::MAX as u64 {
+                    mids.push(n as i32);
+                }
+            } else if let Some(n) = item.as_f64() {
+                mids.push(tick_from_mid(n));
             } else if let Some(o) = item.as_object() {
                 let buy = o.get("buy").and_then(Value::as_f64);
                 let sell = o.get("sell").and_then(Value::as_f64);
                 if let (Some(b), Some(s)) = (buy, sell) {
-                    mids.push(mid_to_tick(mid_from_bid_ask(s, b)));
+                    mids.push(tick_from_mid(mid_from_bid_ask(s, b)));
                 }
             }
         }
+        mids.dedup();
         out.insert(k.clone(), mids);
     }
     out
@@ -193,15 +211,22 @@ mod tests {
     fn parse_legacy_then_numeric_roundtrip() {
         let legacy = r#"{"s":[{"buy":0.52,"sell":0.48,"time":0}]}"#;
         let m = parse_file_content(legacy);
-        assert!((m["s"][0] - 0.5).abs() < 1e-9);
+        assert_eq!(m["s"][0], 50);
     }
 
     #[test]
-    fn skip_duplicate_mid_in_row() {
-        assert!(mid_changed(&[], 0.50));
-        assert!(!mid_changed(&[0.50], 0.50));
-        assert!(mid_changed(&[0.50], 0.51));
-        assert_eq!(mid_to_tick(0.5012), 0.50);
-        assert_eq!(mid_to_tick(0.505), 0.51);
+    fn skip_duplicate_tick_in_row() {
+        assert!(mid_changed(&[], 50));
+        assert!(!mid_changed(&[50], 50));
+        assert!(mid_changed(&[50], 51));
+        assert_eq!(tick_from_mid(0.5012), 50);
+        assert_eq!(tick_from_mid(0.505), 51);
+    }
+
+    #[test]
+    fn migrate_float_blob_to_int_ticks() {
+        let s = r#"{"x":[0.9499999999999999,95,0.9500000000000001]}"#;
+        let m = parse_file_content(s);
+        assert_eq!(m["x"], vec![95]);
     }
 }
