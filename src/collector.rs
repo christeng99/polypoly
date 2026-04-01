@@ -353,8 +353,8 @@ async fn refresh_loop(
             let c = coin.to_ascii_uppercase();
             let old = match state.read() {
                 Ok(g) => g.markets.get(&c).cloned(),
-                Err(e) => {
-                    log::error!("collector state poisoned: {e}");
+                Err(_e) => {
+                    // log::error!("collector state poisoned: {e}");
                     continue;
                 }
             };
@@ -375,7 +375,7 @@ async fn refresh_loop(
                         .await
                         .is_err()
                     {
-                        log::warn!("WS command channel closed");
+                        // log::warn!("WS command channel closed");
                         return;
                     }
 
@@ -400,7 +400,7 @@ async fn refresh_loop(
                     if !ids.is_empty()
                         && cmd_tx.send(WsCommand::Subscribe(ids)).await.is_err()
                     {
-                        log::warn!("WS command channel closed");
+                        // log::warn!("WS command channel closed");
                         return;
                     }
                     if let Ok(mut m) = meta.write() {
@@ -469,7 +469,7 @@ impl PolymarketCollector {
     pub async fn run(self) -> Result<()> {
         let discovery = discover(&self.gamma, &self.config.coins).await?;
         if discovery.all_token_ids.is_empty() {
-            log::warn!("no live markets found for configured coins");
+            // log::warn!("no live markets found for configured coins");
         }
 
         {
@@ -495,8 +495,8 @@ impl PolymarketCollector {
         ws.set_on_book(move |ob| {
             let mg = match meta_b.read() {
                 Ok(g) => g,
-                Err(e) => {
-                    log::error!("meta lock: {e}");
+                Err(_e) => {
+                    // log::error!("meta lock: {e}");
                     return;
                 }
             };
@@ -507,8 +507,8 @@ impl PolymarketCollector {
             drop(mg);
             let q = match state_b.write() {
                 Ok(mut st) => merge_book_quotes(&mut st.quotes, &m, &ob),
-                Err(e) => {
-                    log::error!("state lock: {e}");
+                Err(_e) => {
+                    // log::error!("state lock: {e}");
                     return;
                 }
             };

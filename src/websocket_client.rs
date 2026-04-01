@@ -252,11 +252,11 @@ impl MarketWebSocket {
                 let (w, r) = stream.split();
                 self.write = Some(w);
                 self.read = Some(r);
-                log::info!("WebSocket connected to {}", self.url);
+                // log::info!("WebSocket connected to {}", self.url);
                 true
             }
-            Err(e) => {
-                log::error!("WebSocket connection failed: {e}");
+            Err(_e) => {
+                // log::error!("WebSocket connection failed: {e}");
                 false
             }
         }
@@ -276,14 +276,14 @@ impl MarketWebSocket {
             self.subscribed_assets.insert(id.clone());
         }
 
-        log::info!(
-            "subscribe() {} assets, connected={}",
-            asset_ids.len(),
-            self.is_connected()
-        );
+        // log::info!(
+        //     "subscribe() {} assets, connected={}",
+        //     asset_ids.len(),
+        //     self.is_connected()
+        // );
 
         if !self.is_connected() {
-            log::info!("not connected yet; will subscribe after connect");
+            // log::info!("not connected yet; will subscribe after connect");
             return true;
         }
 
@@ -337,15 +337,15 @@ impl MarketWebSocket {
         };
         let text = match serde_json::to_string(v) {
             Ok(s) => s,
-            Err(e) => {
-                log::error!("serialize subscribe: {e}");
+            Err(_e) => {
+                // log::error!("serialize subscribe: {e}");
                 return false;
             }
         };
         match w.send(Message::Text(text.into())).await {
             Ok(()) => true,
-            Err(e) => {
-                log::error!("send failed: {e}");
+            Err(_e) => {
+                // log::error!("send failed: {e}");
                 false
             }
         }
@@ -356,7 +356,7 @@ impl MarketWebSocket {
             .get("event_type")
             .and_then(Value::as_str)
             .unwrap_or("");
-        log::debug!("event {event_type}");
+        // log::debug!("event {event_type}");
 
         match event_type {
             "book" => {
@@ -385,17 +385,19 @@ impl MarketWebSocket {
                 }
             }
             "tick_size_change" => {
-                log::debug!("tick_size_change: {data}");
+                // log::debug!("tick_size_change: {data}");
             }
-            _ => log::debug!("unknown event_type: {event_type}"),
+            _ => {
+                // log::debug!("unknown event_type: {event_type}");
+            }
         }
     }
 
     async fn process_text(&mut self, text: &str) {
         let data: Value = match serde_json::from_str(text) {
             Ok(v) => v,
-            Err(e) => {
-                log::error!("json parse: {e}");
+            Err(_e) => {
+                // log::error!("json parse: {e}");
                 return;
             }
         };
@@ -421,14 +423,14 @@ impl MarketWebSocket {
                 if ids.is_empty() {
                     return;
                 }
-                log::info!("WS command: subscribe {} token(s)", ids.len());
+                // log::info!("WS command: subscribe {} token(s)", ids.len());
                 let _ = self.subscribe_more(&ids).await;
             }
             WsCommand::Unsubscribe(ids) => {
                 if ids.is_empty() {
                     return;
                 }
-                log::info!("WS command: unsubscribe {} token(s)", ids.len());
+                // log::info!("WS command: unsubscribe {} token(s)", ids.len());
                 let _ = self.unsubscribe(&ids).await;
                 for id in &ids {
                     self.orderbooks.remove(id);
@@ -438,11 +440,11 @@ impl MarketWebSocket {
                 unsubscribe,
                 subscribe,
             } => {
-                log::info!(
-                    "WS command: rotate off {} on {} token(s)",
-                    unsubscribe.len(),
-                    subscribe.len()
-                );
+                // log::info!(
+                //     "WS command: rotate off {} on {} token(s)",
+                //     unsubscribe.len(),
+                //     subscribe.len()
+                // );
                 if !unsubscribe.is_empty() {
                     let _ = self.unsubscribe(&unsubscribe).await;
                     for id in &unsubscribe {
@@ -457,7 +459,6 @@ impl MarketWebSocket {
     }
 
     async fn run_loop(&mut self) {
-        let mut msg_count: u64 = 0;
         while self.running && self.is_connected() {
             self.drain_commands().await;
             let next = {
@@ -467,23 +468,18 @@ impl MarketWebSocket {
 
             match next.await {
                 Err(_) => {
-                    log::warn!("WebSocket receive timeout");
+                    // log::warn!("WebSocket receive timeout");
                     continue;
                 }
                 Ok(None) => {
-                    log::warn!("WebSocket stream ended");
+                    // log::warn!("WebSocket stream ended");
                     break;
                 }
-                Ok(Some(Err(e))) => {
-                    log::warn!("WebSocket read error: {e}");
+                Ok(Some(Err(_e))) => {
+                    // log::warn!("WebSocket read error: {e}");
                     break;
                 }
                 Ok(Some(Ok(Message::Text(t)))) => {
-                    msg_count += 1;
-                    if msg_count <= 5 || msg_count % 1000 == 0 {
-                        let preview: String = t.chars().take(200).collect();
-                        log::info!("WS message #{msg_count}: {preview}");
-                    }
                     self.process_text(&t).await;
                     self.drain_commands().await;
                 }
@@ -495,7 +491,7 @@ impl MarketWebSocket {
                     }
                 }
                 Ok(Some(Ok(Message::Close(_)))) => {
-                    log::warn!("WebSocket close frame");
+                    // log::warn!("WebSocket close frame");
                     break;
                 }
                 Ok(Some(Ok(Message::Frame(_)))) => {}
@@ -514,10 +510,10 @@ impl MarketWebSocket {
         while self.running {
             if !self.connect().await {
                 if auto_reconnect {
-                    log::info!(
-                        "reconnecting in {:?}...",
-                        self.reconnect_interval
-                    );
+                    // log::info!(
+                    //     "reconnecting in {:?}...",
+                    //     self.reconnect_interval
+                    // );
                     tokio::time::sleep(self.reconnect_interval).await;
                     continue;
                 }
@@ -526,7 +522,7 @@ impl MarketWebSocket {
 
             if !self.subscribed_assets.is_empty() {
                 let ids: Vec<String> = self.subscribed_assets.iter().cloned().collect();
-                log::info!("subscribing {} assets after connect", ids.len());
+                // log::info!("subscribing {} assets after connect", ids.len());
                 let _ = self.subscribe(&ids, false).await;
             }
 
@@ -537,7 +533,7 @@ impl MarketWebSocket {
             }
 
             if auto_reconnect {
-                log::info!("reconnecting in {:?}...", self.reconnect_interval);
+                // log::info!("reconnecting in {:?}...", self.reconnect_interval);
                 tokio::time::sleep(self.reconnect_interval).await;
             } else {
                 break;
