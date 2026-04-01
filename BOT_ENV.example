@@ -1,0 +1,48 @@
+# Copy snippets into your real environment (or a .env loader). Never commit secrets.
+#
+# === Multi-bot registry ===
+# Comma-separated bot IDs; each bot must have POLY_BOT_<ID>_* variables (ID uppercased, '-' -> '_').
+POLY_ACTIVE_BOTS=my_btc_bot,other_wallet
+
+# === Global (optional) ===
+# POLY_CLOB_HOST=https://clob.polymarket.com
+# POLY_CHAIN_ID=137
+
+# === Bot: my_btc_bot (env suffix MY_BTC_BOT) ===
+# Markets: coin_leg pairs matching collector outcomes (Gamma uses up/down on 5m crypto markets).
+POLY_BOT_MY_BTC_BOT_MARKETS=btc_up,btc_down
+
+# EOA private key that signs orders (same pattern as Polymarket web / API docs).
+POLY_BOT_MY_BTC_BOT_PRIVATE_KEY=0x...
+
+# Funder = Polymarket proxy / Safe address displayed in the UI (maker on orders).
+POLY_BOT_MY_BTC_BOT_FUNDER=0x...
+
+# Thresholds on **mid** price (0–1). Leave one unset to disable that side.
+POLY_BOT_MY_BTC_BOT_BUY_BELOW=0.35
+POLY_BOT_MY_BTC_BOT_SELL_ABOVE=0.72
+
+# Share size per fill (FOK/GTC as configured).
+POLY_BOT_MY_BTC_BOT_SIZE=5
+
+# FOK = fill-or-kill (good for one-shot intent); GTC/GTD per CLOB docs.
+POLY_BOT_MY_BTC_BOT_ORDER_TYPE=FOK
+
+# 2 = Gnosis Safe / Polymarket default for many accounts (match your account type).
+POLY_BOT_MY_BTC_BOT_SIGNATURE_TYPE=2
+
+# Minimum seconds between fired orders for this bot (per-process).
+POLY_BOT_MY_BTC_BOT_COOLDOWN_SECS=30
+
+# === Second bot example: other_wallet ===
+# POLY_BOT_OTHER_WALLET_MARKETS=eth_up
+# POLY_BOT_OTHER_WALLET_PRIVATE_KEY=0x...
+# POLY_BOT_OTHER_WALLET_FUNDER=0x...
+# POLY_BOT_OTHER_WALLET_BUY_BELOW=0.40
+# POLY_BOT_OTHER_WALLET_SIZE=2
+# POLY_BOT_OTHER_WALLET_ORDER_TYPE=FOK
+
+# To use this as local runtime config:
+# 1) copy this file to `.env`
+# 2) fill real values
+# 3) run cargo as usual (`cargo run`)

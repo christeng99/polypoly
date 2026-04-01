@@ -85,12 +85,8 @@ pub struct CollectorState {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CollectorEvent {
     Book { quote: TokenQuote },
-    PriceChange {
-        coin: String,
-        outcome: String,
-        best_bid: f64,
-        best_ask: f64,
-    },
+    /// Full quote after book merge (includes `token_id`, `market_slug`, `mid`).
+    PriceChange { quote: TokenQuote },
     Trade { quote: TokenQuote },
     MarketRotated {
         coin: String,
@@ -534,19 +530,12 @@ impl PolymarketCollector {
                 let coin = m.coin.clone();
                 let slug = m.market_slug.clone();
                 let outcome = outcome_label(&m.outcome);
-                match state_p.write() {
-                    Ok(mut st) => {
-                        merge_price_change(&mut st.quotes, &m, &pc);
-                    }
+                let quote = match state_p.write() {
+                    Ok(mut st) => merge_price_change(&mut st.quotes, &m, &pc),
                     Err(_) => continue,
-                }
+                };
                 hist_p.record_price_change(&coin, &outcome, &slug, bb, ba);
-                let _ = ev_p.send(CollectorEvent::PriceChange {
-                    coin,
-                    outcome,
-                    best_bid: bb,
-                    best_ask: ba,
-                });
+                let _ = ev_p.send(CollectorEvent::PriceChange { quote });
             }
         });
 
