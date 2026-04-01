@@ -33,7 +33,7 @@ impl Default for CollectorConfig {
                 "SOL".to_string(),
                 "XRP".to_string(),
             ],
-            refresh_interval: Duration::from_secs(15),
+            refresh_interval: Duration::from_secs(2),
             ws_url: WSS_MARKET_URL.to_string(),
         }
     }
