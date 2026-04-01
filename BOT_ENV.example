@@ -31,6 +31,13 @@ POLY_BOT_MY_BTC_BOT_ORDER_TYPE=FOK
 # 2 = Gnosis Safe / Polymarket default for many accounts (match your account type).
 POLY_BOT_MY_BTC_BOT_SIGNATURE_TYPE=2
 
+# Taker fee rate in bps for this market/account (1000 = 10%).
+POLY_BOT_MY_BTC_BOT_FEE_RATE_BPS=1000
+
+# Limit BUY attempts to the first N seconds from round start.
+# Set to 0 or leave unset to disable time-window limiting.
+POLY_BOT_MY_BTC_BOT_BUY_LIMIT_SECS=0
+
 # Minimum seconds between fired orders for this bot (per-process).
 POLY_BOT_MY_BTC_BOT_COOLDOWN_SECS=30
 
@@ -41,6 +48,8 @@ POLY_BOT_MY_BTC_BOT_COOLDOWN_SECS=30
 # POLY_BOT_OTHER_WALLET_BUY_BELOW=0.40
 # POLY_BOT_OTHER_WALLET_SIZE=2
 # POLY_BOT_OTHER_WALLET_ORDER_TYPE=FOK
+# POLY_BOT_OTHER_WALLET_FEE_RATE_BPS=1000
+# POLY_BOT_OTHER_WALLET_BUY_LIMIT_SECS=0
 
 # To use this as local runtime config:
 # 1) copy this file to `.env`

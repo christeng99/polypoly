@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE, Engine as _};
+use ethers_core::types::Address;
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest::Client;
@@ -18,7 +19,6 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct ClobClient {
     http: Client,
     pub host: String,
-    pub funder: String,
     creds: Mutex<Option<ApiCredentials>>,
 }
 
@@ -28,10 +28,14 @@ impl ClobClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("reqwest client")?;
+        let funder_raw: String = funder.into();
+        let _funder_addr: Address = funder_raw
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid funder address: {funder_raw}"))?;
         Ok(Self {
             http,
             host: host.into().trim_end_matches('/').to_string(),
-            funder: funder.into(),
             creds: Mutex::new(None),
         })
     }
@@ -40,7 +44,7 @@ impl ClobClient {
         let mut h = HeaderMap::new();
         h.insert(
             "POLY_ADDRESS",
-            HeaderValue::from_str(&format!("{:?}", signer.address())).unwrap(),
+            HeaderValue::from_str(&signer.address_checksum()).unwrap(),
         );
         h.insert("POLY_SIGNATURE", HeaderValue::from_str(sig).unwrap());
         h.insert("POLY_TIMESTAMP", HeaderValue::from_str(timestamp).unwrap());
@@ -129,7 +133,7 @@ impl ClobClient {
         self.create_or_derive_api_key(signer).await
     }
 
-    fn build_l2(creds: &ApiCredentials, funder: &str, method: &str, path: &str, body: &str) -> Result<HeaderMap> {
+    fn build_l2(creds: &ApiCredentials, signer_address: &str, method: &str, path: &str, body: &str) -> Result<HeaderMap> {
         let timestamp = unix_secs_string();
         let mut msg = format!("{timestamp}{method}{path}");
         if !body.is_empty() {
@@ -140,7 +144,7 @@ impl ClobClient {
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         h.insert(
             "POLY_ADDRESS",
-            HeaderValue::from_str(funder).context("POLY_ADDRESS")?,
+            HeaderValue::from_str(signer_address).context("POLY_ADDRESS")?,
         );
         h.insert("POLY_API_KEY", HeaderValue::from_str(&creds.api_key)?);
         h.insert("POLY_TIMESTAMP", HeaderValue::from_str(&timestamp)?);
@@ -153,21 +157,20 @@ impl ClobClient {
         self: &Arc<Self>,
         signer: &OrderSigner,
         order: OrderPayload,
-        signature_hex: &str,
         order_type: &str,
     ) -> Result<PostOrderResponse> {
         let creds = self.ensure_creds(signer).await?;
 
         let body_struct = PostOrderBody {
             order,
-            owner: self.funder.clone(),
+            owner: creds.api_key.clone(),
             order_type: order_type.to_string(),
-            signature: signature_hex.to_string(),
+            defer_exec: false,
         };
         let body = serde_json::to_string(&body_struct).context("serialize order")?;
-        // println!("[clob] POST /order body={body}");
+        println!("[clob] POST /order body={body}");
         let path = "/order";
-        let headers = Self::build_l2(&creds, &self.funder, "POST", path, &body)?;
+        let headers = Self::build_l2(&creds, &signer.address_checksum(), "POST", path, &body)?;
 
         let url = format!("{}{}", self.host, path);
         let resp = self

@@ -28,6 +28,9 @@ pub struct BotConfig {
     /// `FOK`, `GTC`, or `GTD` per Polymarket CLOB.
     pub order_type: String,
     pub signature_type: u8,
+    pub fee_rate_bps: u32,
+    /// If set (>0), BUY is only allowed from round start until this many seconds.
+    pub buy_limit_secs: Option<u64>,
     pub cooldown: Duration,
 }
 
@@ -115,6 +118,14 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(2u8);
 
+        let fee_rate_bps = env_trim_opt(&bot_env_key(id, "FEE_RATE_BPS"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000u32);
+
+        let buy_limit_secs = env_trim_opt(&bot_env_key(id, "BUY_LIMIT_SECS"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&s| s > 0);
+
         let cooldown_secs: u64 = env_trim_opt(&bot_env_key(id, "COOLDOWN_SECS"))
             .and_then(|s| s.parse().ok())
             .unwrap_or(30);
@@ -131,6 +142,8 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             chain_id,
             order_type,
             signature_type,
+            fee_rate_bps,
+            buy_limit_secs,
             cooldown: Duration::from_secs(cooldown_secs),
         });
     }

@@ -17,18 +17,23 @@ impl ApiCredentials {
     }
 }
 
-/// Submitted order fields (REST), after signing.
+/// Full CLOB order payload for `POST /order` (matches docs `Order` schema).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderPayload {
-    pub token_id: String,
-    pub price: f64,
-    pub size: f64,
-    pub side: String,
     pub maker: String,
-    pub nonce: u64,
+    pub signer: String,
+    pub taker: String,
+    pub token_id: String,
+    pub maker_amount: String,
+    pub taker_amount: String,
+    pub side: String,
+    pub expiration: String,
+    pub nonce: String,
     #[serde(rename = "feeRateBps")]
-    pub fee_rate_bps: u32,
+    pub fee_rate_bps: String,
+    pub signature: String,
+    pub salt: u64,
     #[serde(rename = "signatureType")]
     pub signature_type: u8,
 }
@@ -40,7 +45,7 @@ pub struct PostOrderBody {
     pub order: OrderPayload,
     pub owner: String,
     pub order_type: String,
-    pub signature: String,
+    pub defer_exec: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -7,8 +7,11 @@ use ethers_core::utils::to_checksum;
 use ethers_signers::{LocalWallet, Signer};
 use serde_json::json;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const USDC_DECIMALS: u32 = 6;
+const EXCHANGE_137: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+const EXCHANGE_80002: &str = "0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40";
 
 pub struct OrderSigner {
     wallet: LocalWallet,
@@ -16,6 +19,13 @@ pub struct OrderSigner {
 }
 
 impl OrderSigner {
+    fn exchange_address(&self) -> &'static str {
+        match self.chain_id {
+            80002 => EXCHANGE_80002,
+            _ => EXCHANGE_137,
+        }
+    }
+
     pub fn from_private_key_hex(key_hex: &str) -> Result<Self> {
         let s = key_hex.trim().trim_start_matches("0x");
         let wallet = LocalWallet::from_str(&format!("0x{s}"))
@@ -31,13 +41,14 @@ impl OrderSigner {
         self
     }
 
-    pub fn address(&self) -> Address {
-        self.wallet.address()
+    /// Checksummed signer address (EIP-55).
+    pub fn address_checksum(&self) -> String {
+        to_checksum(&self.wallet.address(), None)
     }
 
     /// L1 signature for `GET /auth/derive-api-key` or `POST /auth/api-key`.
     pub async fn sign_auth_message(&self, timestamp: &str, nonce: u64) -> Result<String> {
-        let addr = format!("{:?}", self.wallet.address());
+        let addr = self.address_checksum();
         let typed: TypedData = serde_json::from_value(json!({
             "types": {
                 "EIP712Domain": [
@@ -86,7 +97,7 @@ impl OrderSigner {
         nonce: u64,
         fee_rate_bps: u32,
         signature_type: u8,
-    ) -> Result<(crate::clob_types::OrderPayload, String)> {
+    ) -> Result<crate::clob_types::OrderPayload> {
         let side_u = if side.eq_ignore_ascii_case("BUY") { 0u8 } else { 1u8 };
         let maker_amount =
             (size * price * 10_f64.powi(USDC_DECIMALS as i32)).round() as u128;
@@ -96,7 +107,12 @@ impl OrderSigner {
             .parse::<Address>()
             .with_context(|| "invalid maker / funder address")?;
         let maker_cs = to_checksum(&maker_addr, None);
-        let signer_addr = format!("{:?}", self.wallet.address());
+        let signer_addr = self.address_checksum();
+        let salt = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ nonce;
 
         let token_u = U256::from_dec_str(token_id.trim())
             .with_context(|| "token_id must be a decimal numeric string for EIP-712")?;
@@ -125,12 +141,13 @@ impl OrderSigner {
             },
             "primaryType": "Order",
             "domain": {
-                "name": "ClobAuthDomain",
+                "name": "Polymarket CTF Exchange",
                 "version": "1",
-                "chainId": self.chain_id
+                "chainId": self.chain_id,
+                "verifyingContract": self.exchange_address()
             },
             "message": {
-                "salt": "0",
+                "salt": salt,
                 "maker": maker_cs,
                 "signer": signer_addr,
                 "taker": "0x0000000000000000000000000000000000000000",
@@ -152,16 +169,22 @@ impl OrderSigner {
             .await
             .context("sign order")?;
 
+        let signature = format!("0x{}", hex::encode(sig.to_vec()));
         let order = crate::clob_types::OrderPayload {
-            token_id: token_id.to_string(),
-            price,
-            size,
-            side: side.to_uppercase(),
             maker: maker_cs,
-            nonce,
-            fee_rate_bps,
+            signer: signer_addr,
+            taker: "0x0000000000000000000000000000000000000000".to_string(),
+            token_id: token_id.to_string(),
+            maker_amount: maker_amount.to_string(),
+            taker_amount: taker_amount.to_string(),
+            side: side.to_uppercase(),
+            expiration: "0".to_string(),
+            nonce: nonce.to_string(),
+            fee_rate_bps: fee_rate_bps.to_string(),
+            signature,
+            salt,
             signature_type,
         };
-        Ok((order, format!("0x{}", hex::encode(sig.to_vec()))))
+        Ok(order)
     }
 }

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 use crate::action_store::ActionStore;
@@ -31,9 +31,27 @@ pub struct BotHandle {
 }
 
 impl BotHandle {
+    fn round_start_secs_from_slug(slug: &str) -> Option<u64> {
+        let (_, tail) = slug.rsplit_once('-')?;
+        tail.parse::<u64>().ok()
+    }
+
+    fn now_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     pub async fn from_config(cfg: BotConfig, actions: Option<Arc<ActionStore>>) -> Result<Arc<Self>> {
         anyhow::ensure!(!cfg.id.is_empty(), "bot id must be non-empty");
         let signer = OrderSigner::from_private_key_hex(&cfg.private_key)?.with_chain_id(cfg.chain_id);
+        println!(
+            "[bot:{}] signer={} funder={}",
+            cfg.id,
+            signer.address_checksum(),
+            cfg.funder
+        );
         let clob = Arc::new(ClobClient::new(&cfg.clob_host, &cfg.funder)?);
         clob.init_creds(&signer).await?;
         Ok(Arc::new(Self {
@@ -83,6 +101,14 @@ impl BotHandle {
             if !(quote.mid <= th && quote.best_ask > 0.0 && quote.best_ask < 1.0) {
                 return;
             }
+            if let Some(limit_secs) = self.cfg.buy_limit_secs {
+                if let Some(round_start_secs) = Self::round_start_secs_from_slug(&quote.market_slug) {
+                    let elapsed_secs = Self::now_unix_secs().saturating_sub(round_start_secs);
+                    if elapsed_secs > limit_secs {
+                        return;
+                    }
+                }
+            }
         
             let mut last_err: Option<String> = None;
             for attempt in 1..=3 {
@@ -92,6 +118,7 @@ impl BotHandle {
                 );
                 match self
                     .place_order(&quote.token_id, quote.best_ask, self.cfg.size, "BUY")
+                    // .place_order(&quote.token_id, quote.best_ask, self.cfg.size, "BUY")
                     .await
                 {
                     Ok(order_id) => {
@@ -191,7 +218,7 @@ impl BotHandle {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let (payload, sig) = self
+        let payload = self
             .signer
             .sign_limit_order(
                 token_id,
@@ -200,13 +227,13 @@ impl BotHandle {
                 side,
                 &self.cfg.funder,
                 nonce,
-                0,
+                self.cfg.fee_rate_bps,
                 self.cfg.signature_type,
             )
             .await?;
         let resp = self
             .clob
-            .post_order(&self.signer, payload, &sig, &self.cfg.order_type)
+            .post_order(&self.signer, payload, &self.cfg.order_type)
             .await?;
         if resp.success.unwrap_or(false) {
             Ok(resp.order_id)
