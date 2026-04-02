@@ -18,7 +18,9 @@ pub struct BotConfig {
     pub legs: Vec<BotMarketLeg>,
     /// Fire BUY when `mid <= buy_below` (and book has a valid ask).
     pub buy_below: Option<f64>,
-    /// Gate: skip BUY if `best_ask > buy_below * buy_price_frac`. Order always uses `best_ask` as limit price.
+    /// Optional ceiling: require `best_ask <= buy_price` (order limit is still live `best_ask`).
+    pub buy_price: Option<f64>,
+    /// With `buy_price`: skip if `best_ask < buy_price * buy_price_frac`. Without `buy_price` (legacy): skip if `best_ask > buy_below * buy_price_frac`.
     pub buy_price_frac: Option<f64>,
     /// Fire SELL when `mid >= sell_above` (and book has a valid bid).
     pub sell_above: Option<f64>,
@@ -108,6 +110,7 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             .to_string();
 
         let buy_below = env_trim_opt(&bot_env_key(id, "BUY_BELOW")).and_then(|s| s.parse().ok());
+        let buy_price = env_trim_opt(&bot_env_key(id, "BUY_PRICE")).and_then(|s| s.parse().ok());
         let buy_price_frac = env_trim_opt(&bot_env_key(id, "BUY_PRICE_FRAC")).and_then(|s| s.parse().ok());
         let sell_above =
             env_trim_opt(&bot_env_key(id, "SELL_ABOVE")).and_then(|s| s.parse().ok());
@@ -138,6 +141,7 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             id: id.to_string(),
             legs,
             buy_below,
+            buy_price,
             buy_price_frac,
             sell_above,
             ontime_amount_usd,

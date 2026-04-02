@@ -88,6 +88,38 @@ impl BotHandle {
         (px * 10_000.0).floor() / 10_000.0
     }
 
+    /// `None` = pass. `Some(reason)` = skip BUY for `best_ask` band / legacy cap.
+    fn buy_ask_price_gate_msg(cfg: &BotConfig, best_ask: f64, buy_below_th: f64) -> Option<String> {
+        const EPS: f64 = 1e-9;
+        if let Some(px) = cfg.buy_price {
+            let cap = Self::floor_price_4dp(px.clamp(1e-6, 0.9999));
+            if best_ask > cap + EPS {
+                return Some(format!(
+                    "best_ask {:.4} > BUY_PRICE {:.4}",
+                    best_ask, cap
+                ));
+            }
+            if let Some(frac) = cfg.buy_price_frac {
+                let fl = Self::floor_price_4dp((px * frac).clamp(1e-6, cap));
+                if best_ask < fl - EPS {
+                    return Some(format!(
+                        "best_ask {:.4} < BUY_PRICE*FRAC {:.4}",
+                        best_ask, fl
+                    ));
+                }
+            }
+        } else if let Some(frac) = cfg.buy_price_frac {
+            let max_ask = Self::floor_price_4dp((buy_below_th * frac).clamp(1e-6, 0.9999));
+            if best_ask > max_ask + EPS {
+                return Some(format!(
+                    "best_ask {:.4} > BUY_BELOW*FRAC {:.4}",
+                    best_ask, max_ask
+                ));
+            }
+        }
+        None
+    }
+
     /// Target ~`usd` maker notional at order limit price `px` (must match signed BUY price).
     fn buy_shares_for_usd(px: f64, usd: f64) -> anyhow::Result<f64> {
         anyhow::ensure!(px > 0.0 && px < 1.0, "invalid buy price {px}");
@@ -188,6 +220,9 @@ impl BotHandle {
             if !(quote.mid <= th && quote.best_ask > 0.0 && quote.best_ask < 1.0) {
                 return;
             }
+            if Self::buy_ask_price_gate_msg(&self.cfg, quote.best_ask, th).is_some() {
+                return;
+            }
             if let Some(limit_secs) = self.cfg.buy_limit_secs {
                 if let Some(round_start_secs) = Self::round_start_secs_from_slug(&quote.market_slug) {
                     let elapsed_secs = Self::now_unix_secs().saturating_sub(round_start_secs);
@@ -244,15 +279,18 @@ impl BotHandle {
                     break;
                 }
 
-                if let Some(frac) = self.cfg.buy_price_frac {
-                    let max_ask = Self::floor_price_4dp((th * frac).clamp(1e-6, 0.9999));
-                    if best_ask > max_ask + 1e-9 {
-                        last_err = Some(format!(
-                            "best_ask {:.4} >= gate {:.4} (BUY_BELOW*{frac})",
-                            best_ask, max_ask
-                        ));
-                        break;
+                if let Some(msg) = Self::buy_ask_price_gate_msg(&self.cfg, best_ask, th) {
+                    last_err = Some(msg);
+                    if order_try > 1 {
+                        println!(
+                            "[bot:{}] BUY retry {} stopped (ask band) {} tok={}",
+                            self.cfg.id,
+                            order_try,
+                            quote.coin,
+                            short_tok(&quote.token_id)
+                        );
                     }
+                    break;
                 }
 
                 let mut buy_size = match Self::buy_shares_for_usd(best_ask, self.cfg.ontime_amount_usd) {
