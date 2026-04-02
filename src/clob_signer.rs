@@ -10,6 +10,8 @@ use std::str::FromStr;
 
 const USDC_DECIMALS: u32 = 6;
 const USDC_MIN_STEP: u128 = 10_000; // 0.01 USDC in 1e6 units (2 decimals)
+/// Polymarket rejects marketable BUY orders whose maker USDC leg rounds below this (1e6 = $1).
+pub const MIN_MARKETABLE_BUY_USDC_MICROS: u128 = 1_000_000;
 /// Outcome token amounts: CLOB allows max **4** decimal places on the outcome leg (buy taker / sell maker).
 const OUTCOME_SHARE_4DP_STEP: u128 = 100; // 0.0001 shares in 1e6 units
 const EXCHANGE_137: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
@@ -23,6 +25,16 @@ pub struct OrderSigner {
 impl OrderSigner {
     fn floor_to_step(value: u128, step: u128) -> u128 {
         (value / step) * step
+    }
+
+    /// BUY maker USDC (6-decimal micros) after the same `floor_to_step` as [`sign_limit_order`].
+    pub fn floored_buy_maker_usdc_micros(size: f64, price: f64) -> u128 {
+        if !size.is_finite() || !price.is_finite() || size <= 0.0 || price <= 0.0 {
+            return 0;
+        }
+        let unit = 10_f64.powi(USDC_DECIMALS as i32);
+        let maker_raw = (size * price * unit) as u128;
+        Self::floor_to_step(maker_raw, USDC_MIN_STEP)
     }
 
     fn exchange_address(&self) -> &'static str {

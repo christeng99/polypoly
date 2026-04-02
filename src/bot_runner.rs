@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use crate::action_store::ActionStore;
 use crate::bot_config::BotConfig;
 use crate::clob_client::ClobClient;
-use crate::clob_signer::OrderSigner;
+use crate::clob_signer::{OrderSigner, MIN_MARKETABLE_BUY_USDC_MICROS};
 use crate::collector::TokenQuote;
 
 #[derive(Debug, Clone, Default)]
@@ -88,15 +88,26 @@ impl BotHandle {
         (px * 10_000.0).floor() / 10_000.0
     }
 
-    /// Target ~`usd` notional at `ask`; enforces Polymarket ~$1 minimum and 5-decimal share steps.
-    fn buy_shares_for_usd(ask: f64, usd: f64) -> anyhow::Result<f64> {
-        anyhow::ensure!(ask > 0.0 && ask < 1.0, "invalid ask {ask}");
+    /// Target ~`usd` maker notional at order limit price `px` (must match signed BUY price).
+    fn buy_shares_for_usd(px: f64, usd: f64) -> anyhow::Result<f64> {
+        anyhow::ensure!(px > 0.0 && px < 1.0, "invalid buy price {px}");
         let target = usd.max(1.0);
-        let min_for_dollar = ((1.0 / ask) / Self::OUTCOME_SHARE_STEP).ceil() * Self::OUTCOME_SHARE_STEP;
-        let want = ((target / ask) / Self::OUTCOME_SHARE_STEP).floor() * Self::OUTCOME_SHARE_STEP;
+        let min_for_dollar = ((1.0 / px) / Self::OUTCOME_SHARE_STEP).ceil() * Self::OUTCOME_SHARE_STEP;
+        let want = ((target / px) / Self::OUTCOME_SHARE_STEP).floor() * Self::OUTCOME_SHARE_STEP;
         let s = want.max(min_for_dollar);
         anyhow::ensure!(s > 0.0 && s.is_finite(), "buy size rounds to zero");
         Ok(s)
+    }
+
+    /// Raise `size` in share steps until CLOB maker USDC (after 1¢ floors) is at least $1.
+    fn bump_buy_shares_for_clob_min(size: &mut f64, limit_px: f64) -> anyhow::Result<()> {
+        let mut guard = 0u32;
+        while OrderSigner::floored_buy_maker_usdc_micros(*size, limit_px) < MIN_MARKETABLE_BUY_USDC_MICROS {
+            *size += Self::OUTCOME_SHARE_STEP;
+            guard += 1;
+            anyhow::ensure!(guard <= 50_000 && *size < 1e12, "buy size cannot satisfy CLOB $1 maker minimum");
+        }
+        Ok(())
     }
 
     pub async fn from_config(cfg: BotConfig, actions: Option<Arc<ActionStore>>) -> Result<Arc<Self>> {
@@ -233,30 +244,33 @@ impl BotHandle {
                     break;
                 }
 
-                let buy_limit_px = if let Some(frac) = self.cfg.buy_price_frac {
-                    let cap = Self::floor_price_4dp((th * frac).clamp(1e-6, 0.9999));
-                    if best_ask > cap + 1e-9 {
+                if let Some(frac) = self.cfg.buy_price_frac {
+                    let max_ask = Self::floor_price_4dp((th * frac).clamp(1e-6, 0.9999));
+                    if best_ask > max_ask + 1e-9 {
                         last_err = Some(format!(
-                            "buy ask {:.4} above cap {:.4} (BUY_BELOW*{frac})",
-                            best_ask, cap
+                            "best_ask {:.4} >= gate {:.4} (BUY_BELOW*{frac})",
+                            best_ask, max_ask
                         ));
                         break;
                     }
-                    cap
-                } else {
-                    best_ask
-                };
+                }
 
-                let buy_size = match Self::buy_shares_for_usd(best_ask, self.cfg.ontime_amount_usd) {
+                let mut buy_size = match Self::buy_shares_for_usd(best_ask, self.cfg.ontime_amount_usd) {
                     Ok(s) => s,
                     Err(e) => {
                         last_err = Some(e.to_string());
                         break;
                     }
                 };
+                if let Err(e) = Self::bump_buy_shares_for_clob_min(&mut buy_size, best_ask) {
+                    last_err = Some(e.to_string());
+                    break;
+                }
+                let maker_usd = OrderSigner::floored_buy_maker_usdc_micros(buy_size, best_ask) as f64
+                    / 1_000_000.0;
 
                 println!(
-                    "[bot:{}] BUY order {}/{} {} …{} mid={:.3} ask={:.3} lim={:.3} sz={:.4} ~${:.2}",
+                    "[bot:{}] BUY order {}/{} {} …{} mid={:.3} ask={:.3} sz={:.4} maker~${:.2} (ONTIME=${:.2})",
                     self.cfg.id,
                     order_try,
                     BUY_ORDER_RETRY_MAX,
@@ -264,12 +278,12 @@ impl BotHandle {
                     short_tok(&quote.token_id),
                     mid,
                     best_ask,
-                    buy_limit_px,
                     buy_size,
-                    buy_size * best_ask
+                    maker_usd,
+                    self.cfg.ontime_amount_usd
                 );
                 match self
-                    .place_order(&quote.token_id, buy_limit_px, buy_size, "BUY")
+                    .place_order(&quote.token_id, best_ask, buy_size, "BUY")
                     .await
                 {
                     Ok(order_id) => {

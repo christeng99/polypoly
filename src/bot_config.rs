@@ -18,8 +18,7 @@ pub struct BotConfig {
     pub legs: Vec<BotMarketLeg>,
     /// Fire BUY when `mid <= buy_below` (and book has a valid ask).
     pub buy_below: Option<f64>,
-    /// When set (e.g. `0.9`), BUY limit price is `buy_below * buy_price_frac` and only if `best_ask` is at or under that cap.
-    /// When unset, BUY limit price is the current `best_ask` (legacy).
+    /// Gate: skip BUY if `best_ask > buy_below * buy_price_frac`. Order always uses `best_ask` as limit price.
     pub buy_price_frac: Option<f64>,
     /// Fire SELL when `mid >= sell_above` (and book has a valid bid).
     pub sell_above: Option<f64>,
