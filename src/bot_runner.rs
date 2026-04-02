@@ -26,6 +26,8 @@ pub struct BotHandle {
     signer: OrderSigner,
     last_fire: Mutex<Option<Instant>>,
     positions: Mutex<HashMap<String, f64>>,
+    /// token_id → order_id of a resting GTC sell. While present, no new sell is placed.
+    pending_sells: Mutex<HashMap<String, String>>,
     trade_lock: Mutex<()>,
     nonce_seq: AtomicU64,
     actions: Option<Arc<ActionStore>>,
@@ -159,6 +161,7 @@ impl BotHandle {
             signer,
             last_fire: Mutex::new(None),
             positions: Mutex::new(HashMap::new()),
+            pending_sells: Mutex::new(HashMap::new()),
             trade_lock: Mutex::new(()),
             nonce_seq: AtomicU64::new(Self::now_unix_secs()),
             actions,
@@ -321,7 +324,7 @@ impl BotHandle {
                     self.cfg.ontime_amount_usd
                 );
                 match self
-                    .place_order(&quote.token_id, best_ask, buy_size, "BUY")
+                    .place_order(&quote.token_id, best_ask, buy_size, "BUY", &self.cfg.order_type)
                     .await
                 {
                     Ok(order_id) => {
@@ -427,6 +430,54 @@ impl BotHandle {
             return;
         }
 
+        // ── SELL SIDE: GTC with balance tracking ──────────────────────────
+        let has_pending = {
+            let ps = self.pending_sells.lock().await;
+            ps.contains_key(&quote.token_id)
+        };
+
+        if has_pending {
+            let balance = self
+                .clob
+                .conditional_token_sellable_shares(
+                    &self.signer,
+                    &quote.token_id,
+                    self.cfg.signature_type,
+                )
+                .await
+                .map(Self::floor_shares_step)
+                .unwrap_or(held);
+
+            if balance <= Self::OUTCOME_SHARE_STEP {
+                println!(
+                    "[bot:{}] SELL complete {} tok={} (balance ≈ 0)",
+                    self.cfg.id, quote.coin, short_tok(&quote.token_id)
+                );
+                {
+                    let mut p = self.positions.lock().await;
+                    p.remove(&quote.token_id);
+                }
+                {
+                    let mut ps = self.pending_sells.lock().await;
+                    ps.remove(&quote.token_id);
+                }
+                let mut st = self.state.lock().await;
+                st.last_decision = format!("SELL filled slug={}", quote.market_slug);
+                st.last_order_id = None;
+                st.last_error = None;
+            } else {
+                {
+                    let mut p = self.positions.lock().await;
+                    p.insert(quote.token_id.clone(), balance);
+                }
+                println!(
+                    "[bot:{}] SELL pending {} tok={} bal={:.4}",
+                    self.cfg.id, quote.coin, short_tok(&quote.token_id), balance
+                );
+            }
+            return;
+        }
+
         let Some(th) = self.cfg.sell_above else {
             return;
         };
@@ -475,7 +526,7 @@ impl BotHandle {
             }
         };
 
-        if sellable <= 0.0 {
+        if sellable <= Self::OUTCOME_SHARE_STEP {
             println!(
                 "[bot:{}] SELL skip 0 {} tok={} trk={:.4}",
                 self.cfg.id, quote.coin, short_tok(&quote.token_id), held
@@ -486,28 +537,25 @@ impl BotHandle {
         }
 
         println!(
-            "[bot:{}] SELL {} …{} mid={:.3} px={:.3} sz={:.4} trk={:.4}",
+            "[bot:{}] SELL {} …{} mid={:.3} bid={:.3} sz={:.4} type={} trk={:.4}",
             self.cfg.id,
             quote.coin,
             short_tok(&quote.token_id),
             mid,
             best_bid,
             sellable,
+            self.cfg.sell_order_type,
             held
         );
         match self
-            .place_order(&quote.token_id, best_bid, sellable, "SELL")
+            .place_order(&quote.token_id, best_bid, sellable, "SELL", &self.cfg.sell_order_type)
             .await
         {
             Ok(order_id) => {
                 println!(
-                    "[bot:{}] SELL ok {} tok={} oid={:?}",
-                    self.cfg.id, quote.coin, short_tok(&quote.token_id), order_id
+                    "[bot:{}] SELL placed {} tok={} oid={:?} type={}",
+                    self.cfg.id, quote.coin, short_tok(&quote.token_id), order_id, self.cfg.sell_order_type
                 );
-                {
-                    let mut p = self.positions.lock().await;
-                    p.remove(&quote.token_id);
-                }
                 if let Some(db) = &self.actions {
                     let _ = db.log_action(
                         &quote.coin,
@@ -517,8 +565,18 @@ impl BotHandle {
                         "sell",
                     );
                 }
+                {
+                    let mut ps = self.pending_sells.lock().await;
+                    ps.insert(
+                        quote.token_id.clone(),
+                        order_id.clone().unwrap_or_default(),
+                    );
+                }
                 let mut st = self.state.lock().await;
-                st.last_decision = format!("SELL ok slug={} mid={:.4}", quote.market_slug, mid);
+                st.last_decision = format!(
+                    "SELL placed slug={} mid={:.4} type={}",
+                    quote.market_slug, mid, self.cfg.sell_order_type
+                );
                 st.last_order_id = order_id;
                 st.last_error = None;
             }
@@ -531,7 +589,7 @@ impl BotHandle {
                     clip_log(&e.to_string(), 90)
                 );
                 let mut st = self.state.lock().await;
-                st.last_decision = "SELL retry pending".to_string();
+                st.last_decision = "SELL submit error".to_string();
                 st.last_error = Some(e.to_string());
             }
         }
@@ -543,6 +601,7 @@ impl BotHandle {
         price: f64,
         size: f64,
         side: &str,
+        order_type: &str,
     ) -> Result<Option<String>> {
         let salt = self.next_salt();
         let payload = self
@@ -560,7 +619,7 @@ impl BotHandle {
             .await?;
         let resp = self
             .clob
-            .post_order(&self.signer, payload, &self.cfg.order_type)
+            .post_order(&self.signer, payload, order_type)
             .await?;
         if resp.success.unwrap_or(false) {
             Ok(resp.order_id)

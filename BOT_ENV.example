@@ -31,8 +31,10 @@ POLY_BOT_MY_BTC_BOT_SELL_ABOVE=0.72
 # USDC notional per BUY (float). Runtime enforces at least ~$1. Share size = ONTIME_AMOUNT / current ask.
 POLY_BOT_MY_BTC_BOT_ONTIME_AMOUNT=5
 
-# FOK = fill-or-kill (good for one-shot intent); GTC/GTD per CLOB docs.
+# BUY order type: FOK = fill-or-kill (one-shot); GTC/GTD per CLOB docs.
 POLY_BOT_MY_BTC_BOT_ORDER_TYPE=FOK
+# SELL order type (default GTC). GTC rests on book; bot polls balance and goes flat when fully sold.
+POLY_BOT_MY_BTC_BOT_SELL_ORDER_TYPE=GTC
 
 # 2 = Gnosis Safe / Polymarket default for many accounts (match your account type).
 POLY_BOT_MY_BTC_BOT_SIGNATURE_TYPE=2

@@ -30,8 +30,10 @@ pub struct BotConfig {
     pub funder: String,
     pub clob_host: String,
     pub chain_id: u64,
-    /// `FOK`, `GTC`, or `GTD` per Polymarket CLOB.
+    /// BUY order type: `FOK`, `GTC`, or `GTD` per Polymarket CLOB.
     pub order_type: String,
+    /// SELL order type (default `GTC`). GTC rests on book; bot polls balance to detect full exit.
+    pub sell_order_type: String,
     pub signature_type: u8,
     pub fee_rate_bps: u32,
     /// If set (>0), BUY is only allowed from round start until this many seconds.
@@ -120,6 +122,7 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             .unwrap_or(5.0);
 
         let order_type = env_trim_opt(&bot_env_key(id, "ORDER_TYPE")).unwrap_or_else(|| "FOK".to_string());
+        let sell_order_type = env_trim_opt(&bot_env_key(id, "SELL_ORDER_TYPE")).unwrap_or_else(|| "GTC".to_string());
 
         let signature_type = env_trim_opt(&bot_env_key(id, "SIGNATURE_TYPE"))
             .and_then(|s| s.parse().ok())
@@ -150,6 +153,7 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             clob_host: global_host.clone(),
             chain_id,
             order_type,
+            sell_order_type,
             signature_type,
             fee_rate_bps,
             buy_limit_secs,
