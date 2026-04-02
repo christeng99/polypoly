@@ -82,12 +82,20 @@ impl BotHandle {
         (shares / Self::OUTCOME_SHARE_STEP).floor() * Self::OUTCOME_SHARE_STEP
     }
 
-    /// CLOB-style price tick (4 decimal places).
+    /// CLOB-style price tick (4 decimal places) — used for internal gate comparisons.
     fn floor_price_4dp(px: f64) -> f64 {
         if !px.is_finite() || px <= 0.0 {
             return 0.0;
         }
         (px * 10_000.0).floor() / 10_000.0
+    }
+
+    /// CLOB minimum tick size is **0.01**. All order prices must be rounded to 2 decimal places.
+    fn round_price_tick(px: f64) -> f64 {
+        if !px.is_finite() || px <= 0.0 {
+            return 0.0;
+        }
+        (px * 100.0).round() / 100.0
     }
 
     /// `None` = pass. `Some(reason)` = skip BUY for `best_ask` band / legacy cap.
@@ -252,7 +260,7 @@ impl BotHandle {
                     .await
                     .unwrap_or(quote.mid);
                 let best_ask = match self.clob.get_market_price(&quote.token_id, "SELL").await {
-                    Ok(px) => px,
+                    Ok(px) => Self::round_price_tick(px),
                     Err(e) => {
                         last_err = Some(e.to_string());
                         println!(
@@ -491,7 +499,7 @@ impl BotHandle {
             .await
             .unwrap_or(quote.mid);
         let best_bid = match self.clob.get_market_price(&quote.token_id, "BUY").await {
-            Ok(px) => px,
+            Ok(px) => Self::round_price_tick(px),
             Err(e) => {
                 println!(
                     "[bot:{}] SELL skip bid {} tok={} {}",
