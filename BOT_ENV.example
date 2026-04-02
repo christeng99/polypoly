@@ -20,13 +20,13 @@ POLY_BOT_MY_BTC_BOT_FUNDER=0x...
 
 # Thresholds on **mid** price (0–1). Leave one unset to disable that side.
 POLY_BOT_MY_BTC_BOT_BUY_BELOW=0.35
-# Optional ask band (order limit is always live best_ask):
-# POLY_BOT_MY_BTC_BOT_BUY_PRICE=0.10   → allow BUY only if best_ask <= 0.10
-# POLY_BOT_MY_BTC_BOT_BUY_PRICE_FRAC=0.9 → and skip if best_ask < 0.10*0.9 (=0.09)
-# Omit BUY_PRICE: if only BUY_PRICE_FRAC is set, legacy rule: skip if best_ask > BUY_BELOW * FRAC.
+# Optional ask band when BUY_PRICE is set (order limit is always live best_ask):
+# POLY_BOT_MY_BTC_BOT_BUY_PRICE=0.10 → allow BUY only if 0.07 <= best_ask <= 0.10 (min ask is hardcoded 0.07).
+# BUY_PRICE_FRAC is ignored when BUY_PRICE is set (legacy: without BUY_PRICE, skip if best_ask > BUY_BELOW * FRAC).
 POLY_BOT_MY_BTC_BOT_BUY_PRICE=0.10
-POLY_BOT_MY_BTC_BOT_BUY_PRICE_FRAC=0.9
 POLY_BOT_MY_BTC_BOT_SELL_ABOVE=0.72
+# After a successful BUY, optional immediate GTC limit sell at this price (uses GTC regardless of SELL_ORDER_TYPE).
+# POLY_BOT_MY_BTC_BOT_SELL_PRICE=0.15
 
 # USDC notional per BUY (float). Runtime enforces at least ~$1. Share size = ONTIME_AMOUNT / current ask.
 POLY_BOT_MY_BTC_BOT_ONTIME_AMOUNT=5

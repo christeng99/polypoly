@@ -45,6 +45,9 @@ fn short_tok(token_id: &str) -> String {
 /// Re-submit a BUY only after `place_order` returns an error — not for soft gate/HTTP read failures.
 const BUY_ORDER_RETRY_MAX: u32 = 7;
 
+/// With `BUY_PRICE` set, BUY is allowed only when `best_ask` is in `[MIN_BUY_BEST_ASK, BUY_PRICE]`.
+const MIN_BUY_BEST_ASK: f64 = 0.07;
+
 fn clip_log(s: &str, max: usize) -> String {
     let mut it = s.chars();
     let chunk: String = it.by_ref().take(max).collect();
@@ -109,14 +112,12 @@ impl BotHandle {
                     best_ask, cap
                 ));
             }
-            if let Some(frac) = cfg.buy_price_frac {
-                let fl = Self::floor_price_4dp((px * frac).clamp(1e-6, cap));
-                if best_ask < fl - EPS {
-                    return Some(format!(
-                        "best_ask {:.4} < BUY_PRICE*FRAC {:.4}",
-                        best_ask, fl
-                    ));
-                }
+            let floor_ask = Self::floor_price_4dp(MIN_BUY_BEST_ASK);
+            if best_ask < floor_ask - EPS {
+                return Some(format!(
+                    "best_ask {:.4} < {:.2} (min ask with BUY_PRICE)",
+                    best_ask, MIN_BUY_BEST_ASK
+                ));
             }
         } else if let Some(frac) = cfg.buy_price_frac {
             let max_ask = Self::floor_price_4dp((buy_below_th * frac).clamp(1e-6, 0.9999));
@@ -373,6 +374,8 @@ impl BotHandle {
                         st.last_decision = format!("BUY ok slug={} mid={:.4}", quote.market_slug, mid);
                         st.last_order_id = order_id;
                         st.last_error = None;
+                        drop(st);
+                        self.place_post_buy_gtc_sell(&quote, tracked).await;
                         return;
                     }
                     Err(e) => {
@@ -425,6 +428,8 @@ impl BotHandle {
                                 );
                                 st.last_order_id = None;
                                 st.last_error = None;
+                                drop(st);
+                                self.place_post_buy_gtc_sell(&quote, tracked).await;
                                 return;
                             }
                         }
@@ -598,6 +603,81 @@ impl BotHandle {
                 );
                 let mut st = self.state.lock().await;
                 st.last_decision = "SELL submit error".to_string();
+                st.last_error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// If `SELL_PRICE` is set, rest a maker GTC sell right after a BUY (same size as filled balance).
+    async fn place_post_buy_gtc_sell(&self, quote: &TokenQuote, sellable_shares: f64) {
+        let Some(limit_px_raw) = self.cfg.sell_price else {
+            return;
+        };
+        let sell_px = Self::round_price_tick(limit_px_raw);
+        if sell_px <= 0.0 || sell_px >= 1.0 {
+            println!(
+                "[bot:{}] post-BUY GTC SELL skip: invalid SELL_PRICE {}",
+                self.cfg.id, limit_px_raw
+            );
+            return;
+        }
+        let sz = Self::floor_shares_step(sellable_shares);
+        if sz <= Self::OUTCOME_SHARE_STEP {
+            return;
+        }
+        println!(
+            "[bot:{}] post-BUY GTC SELL {} tok={} px={:.3} sz={:.4}",
+            self.cfg.id,
+            quote.coin,
+            short_tok(&quote.token_id),
+            sell_px,
+            sz
+        );
+        match self
+            .place_order(&quote.token_id, sell_px, sz, "SELL", "GTC")
+            .await
+        {
+            Ok(order_id) => {
+                println!(
+                    "[bot:{}] post-BUY GTC SELL placed {} tok={} oid={:?}",
+                    self.cfg.id,
+                    quote.coin,
+                    short_tok(&quote.token_id),
+                    order_id
+                );
+                if let Some(db) = &self.actions {
+                    let _ = db.log_action(
+                        &quote.coin,
+                        &quote.market_slug,
+                        sz,
+                        sz * sell_px,
+                        "sell",
+                    );
+                }
+                {
+                    let mut ps = self.pending_sells.lock().await;
+                    ps.insert(
+                        quote.token_id.clone(),
+                        order_id.clone().unwrap_or_default(),
+                    );
+                }
+                let mut st = self.state.lock().await;
+                st.last_decision = format!(
+                    "BUY ok + GTC SELL@{} slug={}",
+                    sell_px, quote.market_slug
+                );
+                st.last_order_id = order_id;
+                st.last_error = None;
+            }
+            Err(e) => {
+                println!(
+                    "[bot:{}] post-BUY GTC SELL fail {} tok={} | {}",
+                    self.cfg.id,
+                    quote.coin,
+                    short_tok(&quote.token_id),
+                    clip_log(&e.to_string(), 90)
+                );
+                let mut st = self.state.lock().await;
                 st.last_error = Some(e.to_string());
             }
         }
