@@ -18,6 +18,9 @@ pub struct BotConfig {
     pub legs: Vec<BotMarketLeg>,
     /// Fire BUY when `mid <= buy_below` (and book has a valid ask).
     pub buy_below: Option<f64>,
+    /// When set (e.g. `0.9`), BUY limit price is `buy_below * buy_price_frac` and only if `best_ask` is at or under that cap.
+    /// When unset, BUY limit price is the current `best_ask` (legacy).
+    pub buy_price_frac: Option<f64>,
     /// Fire SELL when `mid >= sell_above` (and book has a valid bid).
     pub sell_above: Option<f64>,
     /// Target USDC notional per BUY (`POLY_BOT_<ID>_ONTIME_AMOUNT`). Min $1 enforced at runtime.
@@ -106,6 +109,7 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             .to_string();
 
         let buy_below = env_trim_opt(&bot_env_key(id, "BUY_BELOW")).and_then(|s| s.parse().ok());
+        let buy_price_frac = env_trim_opt(&bot_env_key(id, "BUY_PRICE_FRAC")).and_then(|s| s.parse().ok());
         let sell_above =
             env_trim_opt(&bot_env_key(id, "SELL_ABOVE")).and_then(|s| s.parse().ok());
 
@@ -135,6 +139,7 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
             id: id.to_string(),
             legs,
             buy_below,
+            buy_price_frac,
             sell_above,
             ontime_amount_usd,
             private_key,

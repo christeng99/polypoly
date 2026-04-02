@@ -40,8 +40,8 @@ fn short_tok(token_id: &str) -> String {
     }
 }
 
-/// Consecutive BUY attempts with fresh ask between tries.
-const BUY_RETRY_ATTEMPTS: u32 = 7;
+/// Re-submit a BUY only after `place_order` returns an error — not for soft gate/HTTP read failures.
+const BUY_ORDER_RETRY_MAX: u32 = 7;
 
 fn clip_log(s: &str, max: usize) -> String {
     let mut it = s.chars();
@@ -78,6 +78,14 @@ impl BotHandle {
             return 0.0;
         }
         (shares / Self::OUTCOME_SHARE_STEP).floor() * Self::OUTCOME_SHARE_STEP
+    }
+
+    /// CLOB-style price tick (4 decimal places).
+    fn floor_price_4dp(px: f64) -> f64 {
+        if !px.is_finite() || px <= 0.0 {
+            return 0.0;
+        }
+        (px * 10_000.0).floor() / 10_000.0
     }
 
     /// Target ~`usd` notional at `ask`; enforces Polymarket ~$1 minimum and 5-decimal share steps.
@@ -138,10 +146,29 @@ impl BotHandle {
             *lf = Some(Instant::now());
         }
 
-        let held = {
+        let held_mem = {
             let p = self.positions.lock().await;
             *p.get(&quote.token_id).unwrap_or(&0.0)
         };
+        let mut held = held_mem;
+        if held <= Self::OUTCOME_SHARE_STEP {
+            if let Ok(ch) = self
+                .clob
+                .conditional_token_sellable_shares(
+                    &self.signer,
+                    &quote.token_id,
+                    self.cfg.signature_type,
+                )
+                .await
+            {
+                let ch = Self::floor_shares_step(ch);
+                if ch > Self::OUTCOME_SHARE_STEP {
+                    let mut p = self.positions.lock().await;
+                    p.insert(quote.token_id.clone(), ch);
+                    held = ch;
+                }
+            }
+        }
 
         if held <= 0.0 {
             let Some(th) = self.cfg.buy_below else {
@@ -160,9 +187,14 @@ impl BotHandle {
             }
 
             let mut last_err: Option<String> = None;
-            for attempt in 1..=BUY_RETRY_ATTEMPTS {
-                if attempt > 1 {
-                    tokio::time::sleep(Duration::from_millis(120 * attempt as u64)).await;
+            let mut order_try: u32 = 0;
+            loop {
+                order_try += 1;
+                if order_try > BUY_ORDER_RETRY_MAX {
+                    break;
+                }
+                if order_try > 1 {
+                    tokio::time::sleep(Duration::from_millis(120 * order_try as u64)).await;
                 }
 
                 let mid = self
@@ -175,15 +207,13 @@ impl BotHandle {
                     Err(e) => {
                         last_err = Some(e.to_string());
                         println!(
-                            "[bot:{}] BUY {}/{} skip ask {} tok={} {}",
+                            "[bot:{}] BUY skip (no ask) {} tok={} {}",
                             self.cfg.id,
-                            attempt,
-                            BUY_RETRY_ATTEMPTS,
                             quote.coin,
                             short_tok(&quote.token_id),
                             e
                         );
-                        continue;
+                        break;
                     }
                 };
 
@@ -191,35 +221,59 @@ impl BotHandle {
                     last_err = Some(format!(
                         "buy gate failed mid={mid:.4} ask={best_ask:.4} (threshold {th})"
                     ));
-                    continue;
+                    if order_try > 1 {
+                        println!(
+                            "[bot:{}] BUY retry {} stopped (live gate) {} tok={}",
+                            self.cfg.id,
+                            order_try,
+                            quote.coin,
+                            short_tok(&quote.token_id)
+                        );
+                    }
+                    break;
                 }
+
+                let buy_limit_px = if let Some(frac) = self.cfg.buy_price_frac {
+                    let cap = Self::floor_price_4dp((th * frac).clamp(1e-6, 0.9999));
+                    if best_ask > cap + 1e-9 {
+                        last_err = Some(format!(
+                            "buy ask {:.4} above cap {:.4} (BUY_BELOW*{frac})",
+                            best_ask, cap
+                        ));
+                        break;
+                    }
+                    cap
+                } else {
+                    best_ask
+                };
 
                 let buy_size = match Self::buy_shares_for_usd(best_ask, self.cfg.ontime_amount_usd) {
                     Ok(s) => s,
                     Err(e) => {
                         last_err = Some(e.to_string());
-                        continue;
+                        break;
                     }
                 };
 
                 println!(
-                    "[bot:{}] BUY {}/{} {} …{} mid={:.3} px={:.3} sz={:.4} ~${:.2}",
+                    "[bot:{}] BUY order {}/{} {} …{} mid={:.3} ask={:.3} lim={:.3} sz={:.4} ~${:.2}",
                     self.cfg.id,
-                    attempt,
-                    BUY_RETRY_ATTEMPTS,
+                    order_try,
+                    BUY_ORDER_RETRY_MAX,
                     quote.coin,
                     short_tok(&quote.token_id),
                     mid,
                     best_ask,
+                    buy_limit_px,
                     buy_size,
                     buy_size * best_ask
                 );
                 match self
-                    .place_order(&quote.token_id, best_ask, buy_size, "BUY")
+                    .place_order(&quote.token_id, buy_limit_px, buy_size, "BUY")
                     .await
                 {
                     Ok(order_id) => {
-                        let tracked = self
+                        let mut tracked = self
                             .clob
                             .conditional_token_sellable_shares(
                                 &self.signer,
@@ -228,6 +282,9 @@ impl BotHandle {
                             )
                             .await
                             .unwrap_or(buy_size);
+                        if tracked <= Self::OUTCOME_SHARE_STEP {
+                            tracked = buy_size;
+                        }
                         println!(
                             "[bot:{}] BUY ok {} tok={} pos={:.4} oid={:?}",
                             self.cfg.id,
@@ -257,20 +314,63 @@ impl BotHandle {
                     }
                     Err(e) => {
                         println!(
-                            "[bot:{}] BUY {}/{} fail {} tok={} | {}",
+                            "[bot:{}] BUY order {}/{} fail {} tok={} | {}",
                             self.cfg.id,
-                            attempt,
-                            BUY_RETRY_ATTEMPTS,
+                            order_try,
+                            BUY_ORDER_RETRY_MAX,
                             quote.coin,
                             short_tok(&quote.token_id),
                             clip_log(&e.to_string(), 90)
                         );
                         last_err = Some(e.to_string());
+                        if let Ok(bal) = self
+                            .clob
+                            .conditional_token_sellable_shares(
+                                &self.signer,
+                                &quote.token_id,
+                                self.cfg.signature_type,
+                            )
+                            .await
+                        {
+                            let bal = Self::floor_shares_step(bal);
+                            if bal > Self::OUTCOME_SHARE_STEP {
+                                let tracked = bal;
+                                println!(
+                                    "[bot:{}] BUY filled despite error {} tok={} pos={:.4}",
+                                    self.cfg.id,
+                                    quote.coin,
+                                    short_tok(&quote.token_id),
+                                    tracked
+                                );
+                                {
+                                    let mut p = self.positions.lock().await;
+                                    p.insert(quote.token_id.clone(), tracked);
+                                }
+                                if let Some(db) = &self.actions {
+                                    let _ = db.log_action(
+                                        &quote.coin,
+                                        &quote.market_slug,
+                                        tracked,
+                                        tracked * best_ask,
+                                        "buy",
+                                    );
+                                }
+                                let mut st = self.state.lock().await;
+                                st.last_decision = format!(
+                                    "BUY ok (balance) slug={} mid={:.4}",
+                                    quote.market_slug, mid
+                                );
+                                st.last_order_id = None;
+                                st.last_error = None;
+                                return;
+                            }
+                        }
                     }
                 }
             }
             let mut st = self.state.lock().await;
-            st.last_decision = format!("BUY failed after {BUY_RETRY_ATTEMPTS} retries");
+            st.last_decision =
+                format!("BUY incomplete (max {BUY_ORDER_RETRY_MAX} order retries on submit errors)");
             st.last_error = last_err;
             return;
         }

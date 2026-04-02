@@ -20,6 +20,9 @@ POLY_BOT_MY_BTC_BOT_FUNDER=0x...
 
 # Thresholds on **mid** price (0–1). Leave one unset to disable that side.
 POLY_BOT_MY_BTC_BOT_BUY_BELOW=0.35
+# Optional: BUY limit price = BUY_BELOW * this (e.g. 0.9 → cap 0.315); skip if best ask is above cap.
+# Omit for legacy behavior (limit price = best ask only).
+POLY_BOT_MY_BTC_BOT_BUY_PRICE_FRAC=0.9
 POLY_BOT_MY_BTC_BOT_SELL_ABOVE=0.72
 
 # USDC notional per BUY (float). Runtime enforces at least ~$1. Share size = ONTIME_AMOUNT / current ask.
