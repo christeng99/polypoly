@@ -608,8 +608,12 @@ impl BotHandle {
         }
     }
 
-    /// If `SELL_PRICE` is set, rest a maker GTC sell right after a BUY (same size as filled balance).
-    async fn place_post_buy_gtc_sell(&self, quote: &TokenQuote, sellable_shares: f64) {
+    /// If `SELL_PRICE` is set, rest a maker GTC sell right after a BUY.
+    /// Retries with backoff because the CLOB balance may not be available immediately after a fill.
+    const POST_BUY_SELL_RETRY_MAX: u32 = 10;
+    const POST_BUY_SELL_BASE_DELAY_MS: u64 = 500;
+
+    async fn place_post_buy_gtc_sell(&self, quote: &TokenQuote, _fallback_shares: f64) {
         let Some(limit_px_raw) = self.cfg.sell_price else {
             return;
         };
@@ -621,66 +625,127 @@ impl BotHandle {
             );
             return;
         }
-        let sz = Self::floor_shares_step(sellable_shares);
-        if sz <= Self::OUTCOME_SHARE_STEP {
-            return;
+
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=Self::POST_BUY_SELL_RETRY_MAX {
+            if attempt > 1 {
+                let delay = Self::POST_BUY_SELL_BASE_DELAY_MS * attempt as u64;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+
+            let sellable = match self
+                .clob
+                .conditional_token_sellable_shares(
+                    &self.signer,
+                    &quote.token_id,
+                    self.cfg.signature_type,
+                )
+                .await
+            {
+                Ok(s) => Self::floor_shares_step(s),
+                Err(e) => {
+                    println!(
+                        "[bot:{}] post-BUY GTC SELL {}/{} balance err {} tok={} | {}",
+                        self.cfg.id,
+                        attempt,
+                        Self::POST_BUY_SELL_RETRY_MAX,
+                        quote.coin,
+                        short_tok(&quote.token_id),
+                        clip_log(&e.to_string(), 60)
+                    );
+                    last_err = Some(e.to_string());
+                    continue;
+                }
+            };
+
+            if sellable <= Self::OUTCOME_SHARE_STEP {
+                println!(
+                    "[bot:{}] post-BUY GTC SELL {}/{} waiting for balance {} tok={} (bal=0)",
+                    self.cfg.id,
+                    attempt,
+                    Self::POST_BUY_SELL_RETRY_MAX,
+                    quote.coin,
+                    short_tok(&quote.token_id)
+                );
+                last_err = Some("balance not yet available".to_string());
+                continue;
+            }
+
+            println!(
+                "[bot:{}] post-BUY GTC SELL {}/{} {} tok={} px={:.3} sz={:.4}",
+                self.cfg.id,
+                attempt,
+                Self::POST_BUY_SELL_RETRY_MAX,
+                quote.coin,
+                short_tok(&quote.token_id),
+                sell_px,
+                sellable
+            );
+            match self
+                .place_order(&quote.token_id, sell_px, sellable, "SELL", "GTC")
+                .await
+            {
+                Ok(order_id) => {
+                    println!(
+                        "[bot:{}] post-BUY GTC SELL placed {} tok={} oid={:?}",
+                        self.cfg.id,
+                        quote.coin,
+                        short_tok(&quote.token_id),
+                        order_id
+                    );
+                    if let Some(db) = &self.actions {
+                        let _ = db.log_action(
+                            &quote.coin,
+                            &quote.market_slug,
+                            sellable,
+                            sellable * sell_px,
+                            "sell",
+                        );
+                    }
+                    {
+                        let mut ps = self.pending_sells.lock().await;
+                        ps.insert(
+                            quote.token_id.clone(),
+                            order_id.clone().unwrap_or_default(),
+                        );
+                    }
+                    {
+                        let mut p = self.positions.lock().await;
+                        p.insert(quote.token_id.clone(), sellable);
+                    }
+                    let mut st = self.state.lock().await;
+                    st.last_decision = format!(
+                        "BUY ok + GTC SELL@{} slug={}",
+                        sell_px, quote.market_slug
+                    );
+                    st.last_order_id = order_id;
+                    st.last_error = None;
+                    return;
+                }
+                Err(e) => {
+                    println!(
+                        "[bot:{}] post-BUY GTC SELL {}/{} fail {} tok={} | {}",
+                        self.cfg.id,
+                        attempt,
+                        Self::POST_BUY_SELL_RETRY_MAX,
+                        quote.coin,
+                        short_tok(&quote.token_id),
+                        clip_log(&e.to_string(), 90)
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
         }
         println!(
-            "[bot:{}] post-BUY GTC SELL {} tok={} px={:.3} sz={:.4}",
+            "[bot:{}] post-BUY GTC SELL GAVE UP after {} retries {} tok={} | {}",
             self.cfg.id,
+            Self::POST_BUY_SELL_RETRY_MAX,
             quote.coin,
             short_tok(&quote.token_id),
-            sell_px,
-            sz
+            last_err.as_deref().unwrap_or("?")
         );
-        match self
-            .place_order(&quote.token_id, sell_px, sz, "SELL", "GTC")
-            .await
-        {
-            Ok(order_id) => {
-                println!(
-                    "[bot:{}] post-BUY GTC SELL placed {} tok={} oid={:?}",
-                    self.cfg.id,
-                    quote.coin,
-                    short_tok(&quote.token_id),
-                    order_id
-                );
-                if let Some(db) = &self.actions {
-                    let _ = db.log_action(
-                        &quote.coin,
-                        &quote.market_slug,
-                        sz,
-                        sz * sell_px,
-                        "sell",
-                    );
-                }
-                {
-                    let mut ps = self.pending_sells.lock().await;
-                    ps.insert(
-                        quote.token_id.clone(),
-                        order_id.clone().unwrap_or_default(),
-                    );
-                }
-                let mut st = self.state.lock().await;
-                st.last_decision = format!(
-                    "BUY ok + GTC SELL@{} slug={}",
-                    sell_px, quote.market_slug
-                );
-                st.last_order_id = order_id;
-                st.last_error = None;
-            }
-            Err(e) => {
-                println!(
-                    "[bot:{}] post-BUY GTC SELL fail {} tok={} | {}",
-                    self.cfg.id,
-                    quote.coin,
-                    short_tok(&quote.token_id),
-                    clip_log(&e.to_string(), 90)
-                );
-                let mut st = self.state.lock().await;
-                st.last_error = Some(e.to_string());
-            }
-        }
+        let mut st = self.state.lock().await;
+        st.last_error = last_err;
     }
 
     async fn place_order(
