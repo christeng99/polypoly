@@ -8,12 +8,8 @@ use ethers_signers::{LocalWallet, Signer};
 use serde_json::json;
 use std::str::FromStr;
 
-const USDC_DECIMALS: u32 = 6;
-const USDC_MIN_STEP: u128 = 10_000; // 0.01 USDC in 1e6 units (2 decimals)
 /// Polymarket rejects marketable BUY orders whose maker USDC leg rounds below this (1e6 = $1).
 pub const MIN_MARKETABLE_BUY_USDC_MICROS: u128 = 1_000_000;
-/// Outcome token amounts: CLOB allows max **4** decimal places on the outcome leg (buy taker / sell maker).
-const OUTCOME_SHARE_4DP_STEP: u128 = 100; // 0.0001 shares in 1e6 units
 const EXCHANGE_137: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 const EXCHANGE_80002: &str = "0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40";
 
@@ -23,18 +19,25 @@ pub struct OrderSigner {
 }
 
 impl OrderSigner {
-    fn floor_to_step(value: u128, step: u128) -> u128 {
-        (value / step) * step
+    /// Integer representations used to compute order amounts without f64 drift.
+    /// `size_deci4`: size in 0.0001-share units; `price_cents`: price in 0.01 units.
+    /// outcome_micros = size_deci4 * 100, usdc_micros = size_deci4 * price_cents.
+    /// The ratio usdc/outcome = price_cents/100 — always on 0.01 tick by construction.
+    fn int_amounts(size: f64, price: f64) -> (u128, u128) {
+        let price_cents = (price * 100.0).round() as u128;
+        let size_deci4 = (size * 10_000.0).round() as u128;
+        let outcome_micros = size_deci4 * 100;
+        let usdc_micros = size_deci4 * price_cents;
+        (outcome_micros, usdc_micros)
     }
 
-    /// BUY maker USDC (6-decimal micros) after the same `floor_to_step` as [`sign_limit_order`].
+    /// BUY maker USDC in micros, matching the integer arithmetic in [`sign_limit_order`].
     pub fn floored_buy_maker_usdc_micros(size: f64, price: f64) -> u128 {
         if !size.is_finite() || !price.is_finite() || size <= 0.0 || price <= 0.0 {
             return 0;
         }
-        let unit = 10_f64.powi(USDC_DECIMALS as i32);
-        let maker_raw = (size * price * unit) as u128;
-        Self::floor_to_step(maker_raw, USDC_MIN_STEP)
+        let (_outcome, usdc) = Self::int_amounts(size, price);
+        usdc
     }
 
     fn exchange_address(&self) -> &'static str {
@@ -120,26 +123,12 @@ impl OrderSigner {
     ) -> Result<crate::clob_types::OrderPayload> {
         let is_buy = side.eq_ignore_ascii_case("BUY");
         let side_u = if is_buy { 0u8 } else { 1u8 };
-        let unit = 10_f64.powi(USDC_DECIMALS as i32);
-        let maker_raw = if is_buy {
-            (size * price * unit) as u128
+
+        let (outcome_micros, usdc_micros) = Self::int_amounts(size, price);
+        let (maker_amount, taker_amount) = if is_buy {
+            (usdc_micros, outcome_micros)
         } else {
-            (size * unit) as u128
-        };
-        let taker_raw = if is_buy {
-            (size * unit) as u128
-        } else {
-            (size * price * unit) as u128
-        };
-        let maker_amount = if is_buy {
-            Self::floor_to_step(maker_raw, USDC_MIN_STEP)
-        } else {
-            Self::floor_to_step(maker_raw, OUTCOME_SHARE_4DP_STEP)
-        };
-        let taker_amount = if is_buy {
-            Self::floor_to_step(taker_raw, OUTCOME_SHARE_4DP_STEP)
-        } else {
-            Self::floor_to_step(taker_raw, USDC_MIN_STEP)
+            (outcome_micros, usdc_micros)
         };
         anyhow::ensure!(maker_amount > 0, "maker amount rounds to zero");
         anyhow::ensure!(taker_amount > 0, "taker amount rounds to zero");
