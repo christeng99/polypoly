@@ -31,7 +31,8 @@ async fn main() -> Result<()> {
     let bots: Vec<Arc<BotHandle>> = if bot_defs.is_empty() {
         vec![]
     } else {
-        cfg.coins = bot_config::collector_coins_from_bots(&bot_defs);
+        // Always track the full hardcoded coin set from `CollectorConfig::default`,
+        // regardless of which coins the bots trade.
         let mut handles = Vec::with_capacity(bot_defs.len());
         for def in bot_defs {
             handles.push(BotHandle::from_config(def, action_store.clone()).await?);
