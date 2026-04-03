@@ -609,9 +609,23 @@ impl BotHandle {
     }
 
     /// If `SELL_PRICE` is set, rest a maker GTC sell right after a BUY.
-    /// Retries with backoff because the CLOB balance may not be available immediately after a fill.
-    const POST_BUY_SELL_RETRY_MAX: u32 = 10;
-    const POST_BUY_SELL_BASE_DELAY_MS: u64 = 500;
+    /// Retries until the round ends because the CLOB balance may not be available immediately.
+    /// If the CLOB rejects for insufficient balance, parses the actual balance from the error
+    /// and retries with the corrected size.
+    const POST_BUY_SELL_DELAY_MS: u64 = 1_500;
+    const POST_BUY_SELL_ROUND_SECS: u64 = 300;
+
+    /// Parse `"balance: <micros>"` from a CLOB error message and convert to shares.
+    fn parse_balance_from_error(err: &str) -> Option<f64> {
+        let idx = err.find("balance:")?;
+        let after = &err[idx + "balance:".len()..];
+        let digits: String = after.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+        let micros: u128 = digits.parse().ok()?;
+        if micros == 0 {
+            return None;
+        }
+        Some(micros as f64 / 1_000_000.0)
+    }
 
     async fn place_post_buy_gtc_sell(&self, quote: &TokenQuote, _fallback_shares: f64) {
         let Some(limit_px_raw) = self.cfg.sell_price else {
@@ -626,44 +640,58 @@ impl BotHandle {
             return;
         }
 
+        let deadline = {
+            let base = Self::round_start_secs_from_slug(&quote.market_slug)
+                .unwrap_or(Self::now_unix_secs());
+            base + Self::POST_BUY_SELL_ROUND_SECS
+        };
+
         let mut last_err: Option<String> = None;
-        for attempt in 1..=Self::POST_BUY_SELL_RETRY_MAX {
+        let mut attempt: u32 = 0;
+        let mut override_size: Option<f64> = None;
+
+        loop {
+            attempt += 1;
+            if Self::now_unix_secs() >= deadline {
+                break;
+            }
             if attempt > 1 {
-                let delay = Self::POST_BUY_SELL_BASE_DELAY_MS * attempt as u64;
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+                tokio::time::sleep(Duration::from_millis(Self::POST_BUY_SELL_DELAY_MS)).await;
             }
 
-            let sellable = match self
-                .clob
-                .conditional_token_sellable_shares(
-                    &self.signer,
-                    &quote.token_id,
-                    self.cfg.signature_type,
-                )
-                .await
-            {
-                Ok(s) => Self::floor_shares_step(s),
-                Err(e) => {
-                    println!(
-                        "[bot:{}] post-BUY GTC SELL {}/{} balance err {} tok={} | {}",
-                        self.cfg.id,
-                        attempt,
-                        Self::POST_BUY_SELL_RETRY_MAX,
-                        quote.coin,
-                        short_tok(&quote.token_id),
-                        clip_log(&e.to_string(), 60)
-                    );
-                    last_err = Some(e.to_string());
-                    continue;
+            let sellable = if let Some(ov) = override_size.take() {
+                ov
+            } else {
+                match self
+                    .clob
+                    .conditional_token_sellable_shares(
+                        &self.signer,
+                        &quote.token_id,
+                        self.cfg.signature_type,
+                    )
+                    .await
+                {
+                    Ok(s) => Self::floor_shares_step(s),
+                    Err(e) => {
+                        println!(
+                            "[bot:{}] post-BUY GTC SELL #{} balance err {} tok={} | {}",
+                            self.cfg.id,
+                            attempt,
+                            quote.coin,
+                            short_tok(&quote.token_id),
+                            clip_log(&e.to_string(), 60)
+                        );
+                        last_err = Some(e.to_string());
+                        continue;
+                    }
                 }
             };
 
             if sellable <= Self::OUTCOME_SHARE_STEP {
                 println!(
-                    "[bot:{}] post-BUY GTC SELL {}/{} waiting for balance {} tok={} (bal=0)",
+                    "[bot:{}] post-BUY GTC SELL #{} waiting for balance {} tok={}",
                     self.cfg.id,
                     attempt,
-                    Self::POST_BUY_SELL_RETRY_MAX,
                     quote.coin,
                     short_tok(&quote.token_id)
                 );
@@ -672,10 +700,9 @@ impl BotHandle {
             }
 
             println!(
-                "[bot:{}] post-BUY GTC SELL {}/{} {} tok={} px={:.3} sz={:.4}",
+                "[bot:{}] post-BUY GTC SELL #{} {} tok={} px={:.3} sz={:.4}",
                 self.cfg.id,
                 attempt,
-                Self::POST_BUY_SELL_RETRY_MAX,
                 quote.coin,
                 short_tok(&quote.token_id),
                 sell_px,
@@ -723,23 +750,32 @@ impl BotHandle {
                     return;
                 }
                 Err(e) => {
+                    let err_str = e.to_string();
                     println!(
-                        "[bot:{}] post-BUY GTC SELL {}/{} fail {} tok={} | {}",
+                        "[bot:{}] post-BUY GTC SELL #{} fail {} tok={} | {}",
                         self.cfg.id,
                         attempt,
-                        Self::POST_BUY_SELL_RETRY_MAX,
                         quote.coin,
                         short_tok(&quote.token_id),
-                        clip_log(&e.to_string(), 90)
+                        clip_log(&err_str, 120)
                     );
-                    last_err = Some(e.to_string());
+                    if let Some(bal) = Self::parse_balance_from_error(&err_str) {
+                        let corrected = Self::floor_shares_step(bal);
+                        if corrected > Self::OUTCOME_SHARE_STEP {
+                            println!(
+                                "[bot:{}] post-BUY GTC SELL #{} using balance from error: {:.4}",
+                                self.cfg.id, attempt, corrected
+                            );
+                            override_size = Some(corrected);
+                        }
+                    }
+                    last_err = Some(err_str);
                 }
             }
         }
         println!(
-            "[bot:{}] post-BUY GTC SELL GAVE UP after {} retries {} tok={} | {}",
+            "[bot:{}] post-BUY GTC SELL GAVE UP (round ended) {} tok={} | {}",
             self.cfg.id,
-            Self::POST_BUY_SELL_RETRY_MAX,
             quote.coin,
             short_tok(&quote.token_id),
             last_err.as_deref().unwrap_or("?")
