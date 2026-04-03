@@ -1,7 +1,6 @@
 //! Load multi-bot configuration from environment (`POLY_ACTIVE_BOTS`, `POLY_BOT_<ID>_*`).
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 
@@ -166,17 +165,4 @@ pub fn load_bots_from_env() -> Result<Vec<BotConfig>> {
     }
 
     Ok(out)
-}
-
-/// Union of configured coins for [`CollectorConfig::coins`].
-pub fn collector_coins_from_bots(bots: &[BotConfig]) -> Vec<String> {
-    let mut s: HashSet<String> = HashSet::new();
-    for b in bots {
-        for leg in &b.legs {
-            s.insert(leg.coin.clone());
-        }
-    }
-    let mut v: Vec<_> = s.into_iter().collect();
-    v.sort();
-    v
 }

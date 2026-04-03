@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let _ = dotenvy::dotenv();
 
-    let mut cfg = CollectorConfig::default();
+    let cfg = CollectorConfig::default();
     let bot_defs = bot_config::load_bots_from_env()?;
     let action_store = if bot_defs.is_empty() {
         None
