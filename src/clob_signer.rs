@@ -19,16 +19,28 @@ pub struct OrderSigner {
 }
 
 impl OrderSigner {
-    /// Integer representations used to compute order amounts without f64 drift.
-    /// `size_deci4`: size in 0.0001-share units; `price_cents`: price in 0.01 units.
-    /// outcome_micros = size_deci4 * 100, usdc_micros = size_deci4 * price_cents.
-    /// The ratio usdc/outcome = price_cents/100 — always on 0.01 tick by construction.
-    fn int_amounts(size: f64, price: f64) -> (u128, u128) {
+    /// Integer representations for order amounts without f64 drift.
+    ///
+    /// CLOB precision rules (from Polymarket Python SDK):
+    ///   BUY  – size to 4dp (0.0001 shares), outcome taker multiple of 100, USDC maker exact.
+    ///   SELL – size to 2dp (0.01 shares),   outcome maker multiple of 10 000, USDC taker multiple of 100.
+    ///
+    /// Returns `(outcome_micros, usdc_micros)`.
+    /// Price ratio `usdc / outcome = price_cents / 100` — always on 0.01 tick because
+    /// the size factor cancels in the ratio.
+    fn int_amounts(size: f64, price: f64, is_buy: bool) -> (u128, u128) {
         let price_cents = (price * 100.0).round() as u128;
-        let size_deci4 = (size * 10_000.0).round() as u128;
-        let outcome_micros = size_deci4 * 100;
-        let usdc_micros = size_deci4 * price_cents;
-        (outcome_micros, usdc_micros)
+        if is_buy {
+            let size_deci4 = (size * 10_000.0).round() as u128;
+            let outcome_micros = size_deci4 * 100;
+            let usdc_micros = size_deci4 * price_cents;
+            (outcome_micros, usdc_micros)
+        } else {
+            let size_cents = (size * 100.0).round() as u128;
+            let outcome_micros = size_cents * 10_000;
+            let usdc_micros = size_cents * price_cents * 100;
+            (outcome_micros, usdc_micros)
+        }
     }
 
     /// BUY maker USDC in micros, matching the integer arithmetic in [`sign_limit_order`].
@@ -36,7 +48,7 @@ impl OrderSigner {
         if !size.is_finite() || !price.is_finite() || size <= 0.0 || price <= 0.0 {
             return 0;
         }
-        let (_outcome, usdc) = Self::int_amounts(size, price);
+        let (_outcome, usdc) = Self::int_amounts(size, price, true);
         usdc
     }
 
@@ -124,7 +136,7 @@ impl OrderSigner {
         let is_buy = side.eq_ignore_ascii_case("BUY");
         let side_u = if is_buy { 0u8 } else { 1u8 };
 
-        let (outcome_micros, usdc_micros) = Self::int_amounts(size, price);
+        let (outcome_micros, usdc_micros) = Self::int_amounts(size, price, is_buy);
         let (maker_amount, taker_amount) = if is_buy {
             (usdc_micros, outcome_micros)
         } else {
